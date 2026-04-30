@@ -1,0 +1,14 @@
+names:
+- bateria
+- mesa
+nc: 2
+path: /home/human/BinPicking/binpicking-instancias-6
+roboflow:
+  license: CC BY 4.0
+  project: binpicking-instancias
+  url: https://universe.roboflow.com/josephs-workspace-gguso/binpicking-instancias/dataset/6
+  version: 6
+  workspace: josephs-workspace-gguso
+test: test/images
+train: train/images
+val: valid/images

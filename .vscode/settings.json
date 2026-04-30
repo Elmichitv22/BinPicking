@@ -1,0 +1,6 @@
+{
+  "python.defaultInterpreterPath": "/home/human/BinPicking/.venv/bin/python",
+  "python.analysis.extraPaths": [
+    "/home/human/BinPicking/.venv/lib/python3.13/site-packages"
+  ]
+}
