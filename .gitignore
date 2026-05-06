@@ -1,0 +1,26 @@
+# Ignora archivos de calibración, resultados y temporales
+*.pkl
+*.yaml
+*.yml
+*.json
+*.csv
+*.log
+*.txt
+
+# Carpetas de resultados y temporales
+calibracion/
+logs/
+runs/
+__pycache__/
+
+# Imágenes y datos de datasets
+*.png
+*.jpg
+*.jpeg
+*.bmp
+*.webp
+
+# Otros
+.DS_Store
+*.swp
+*.swo

@@ -46,17 +46,27 @@ PAUSE = 522 - 1
 CONTINUE = 523 - 1
 RESET = 524 - 1
 
-# Words visibles (tus separados 16)
 REG_X = 32
 REG_Y = 48
 REG_Z = 64
 REG_U = 80
 
 POSE_SCALE = 100.0
-TABLE_WIDTH_MM = 208.80
-TABLE_HEIGHT_MM = 208.80
-CAMERA_X_OFFSET_MM = 0.45
-CAMERA_Y_OFFSET_MM = -0.90
+TABLE_WIDTH_MM = 209.00
+TABLE_HEIGHT_MM = 209.00
+CAMERA_X_OFFSET_MM = 0.00
+CAMERA_Y_OFFSET_MM = 0.00
+MANUAL_ROBOT_POINTS = [
+    (20.0, 20.0),
+    (104.5, 20.0),
+    (189.0, 20.0),
+    (20.0, 104.5),
+    (104.5, 104.5),
+    (189.0, 104.5),
+    (20.0, 189.0),
+    (104.5, 189.0),
+    (189.0, 189.0),
+]
 
 Z_OFFSET_MM = 100.0
 
@@ -82,10 +92,8 @@ CENTER_EMA_ALPHA = 0.08
 U_EMA_ALPHA = 0.12
 USE_EDGE_REFINEMENT = False
 
-# MantÃ©n Z constante hasta que tengas profundidad real
-Z_MM_CONST = 50  #Para otra mesa debe estar en -0.008
+Z_MM_CONST = 50
 
-# Solo U por teclado (bias)
 U_STEP_DEG = 5.0
 DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parent / "camera_calibration.yaml"
 DEFAULT_FIXED_HOMOGRAPHY_PATH = Path(__file__).resolve().parent / "homography_table1.json"
@@ -119,7 +127,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Aplica correccion de distorsion antes de YOLO usando la calibracion cargada.",
     )
-
     p.add_argument("--host", default="192.168.250.10")
     p.add_argument("--port", type=int, default=502)
     p.add_argument("--unit-id", type=int, default=1)
@@ -188,7 +195,6 @@ class EpsonClient(EpsonModbusClient):
 
     def write_pose_robot_mm_deg(self, x_mm: float, y_mm: float, z_mm: float, u_deg: float) -> None:
         z_send_mm = z_mm + Z_OFFSET_MM
-        # U se envia como angulo absoluto 0..360, sin signo.
         u_send_deg = normalize_deg_360(u_deg)
 
         x_i = int(round(float(x_mm) * POSE_SCALE))
@@ -303,10 +309,6 @@ def ema_angle_deg(current: float, previous: Optional[float], alpha: float) -> fl
 
 
 def angle_deg_to_word(angle_deg: float) -> int:
-    """
-    Convierte grados absolutos 0..360 a Word Modbus unsigned, escalado x100.
-    Ejemplo: 270.0 -> 27000.
-    """
     angle_robot = normalize_deg_360(angle_deg)
     scaled = int(round(angle_robot * POSE_SCALE))
     if scaled < 0 or scaled > 65535:
@@ -315,10 +317,6 @@ def angle_deg_to_word(angle_deg: float) -> int:
 
 
 def compass_bearing_to_robot_u(bearing_deg: float) -> float:
-    """
-    Convierte el rumbo de vision al U del robot en rango absoluto [0, 360).
-    Asi, 270 grados visuales se envian como 270 grados al RC90.
-    """
     return normalize_deg_360(bearing_deg)
 
 
@@ -371,7 +369,12 @@ def _is_valid_homography_matrix(homography: np.ndarray) -> bool:
 
 def _is_valid_src_points(src_pts: np.ndarray) -> bool:
     points = np.asarray(src_pts, dtype=np.float64)
-    return points.shape == (4, 2) and np.isfinite(points).all()
+    return (
+        points.ndim == 2
+        and points.shape[1] == 2
+        and points.shape[0] >= 4
+        and np.isfinite(points).all()
+    )
 
 
 def _ordered_table_corners_bottom_left_origin(corners: np.ndarray) -> np.ndarray:
@@ -431,6 +434,7 @@ def save_fixed_homography_with_metadata(
     homography: np.ndarray,
     src_pts: np.ndarray,
     metadata: dict,
+    dst_pts: Optional[np.ndarray] = None,
 ) -> None:
     if not isinstance(metadata, dict):
         raise ValueError("metadata debe ser un diccionario")
@@ -438,7 +442,7 @@ def save_fixed_homography_with_metadata(
     if not _is_valid_homography_matrix(homography):
         raise ValueError("La homografia debe ser una matriz 3x3 finita")
     if not _is_valid_src_points(src_pts):
-        raise ValueError("src_pts debe contener 4 puntos 2D finitos")
+        raise ValueError("src_pts debe contener al menos 4 puntos 2D finitos")
 
     payload = {
         "homography": np.asarray(homography, dtype=np.float64).tolist(),
@@ -451,6 +455,9 @@ def save_fixed_homography_with_metadata(
         "height": int(metadata.get("height")),
         "undistort": bool(metadata.get("undistort")),
     }
+
+    if dst_pts is not None:
+        payload["dst_pts_robot"] = np.asarray(dst_pts, dtype=np.float64).tolist()
 
     file_path.parent.mkdir(parents=True, exist_ok=True)
     with file_path.open("w", encoding="utf-8") as handle:
@@ -850,6 +857,24 @@ def draw_panel(img, zoom, u_bias, u_send, robot_status, x_mm=None, y_mm=None, z_
 
 
 def main() -> int:
+    # --- Calibracion manual ---
+    manual_calib_mode = False
+    manual_points_px = []       # [(x, y)]
+    manual_points_robot = []    # [(x_mm, y_mm)]
+    manual_homography = None
+    manual_homography_error = None
+    manual_homography_path = Path(__file__).resolve().parent / "homography_table1.json"
+    manual_last_click = None
+    manual_robot_idx = 0
+
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal manual_last_click
+        if manual_calib_mode and event == cv2.EVENT_LBUTTONDOWN:
+            manual_last_click = (x, y)
+
+    cv2.namedWindow("XYZU LIVE (click aqui para teclado)")
+    cv2.setMouseCallback("XYZU LIVE (click aqui para teclado)", mouse_callback)
+
     args = parse_args()
 
     model_path = Path(args.model)
@@ -997,7 +1022,6 @@ def main() -> int:
             mesa_idx = select_primary_table_index(result)
             mesa_indices = select_table_indices(result)
             non_table_indices = list_non_table_indices(result)
-            target_idx = non_table_indices[0] if non_table_indices else None
 
             annotated = draw_detections(frame, result, non_table_indices, mesa_indices)
             annotated = draw_table_workobject(annotated, result, mesa_idx, fixed_pose=None)
@@ -1019,21 +1043,18 @@ def main() -> int:
             if not battery_detected and last_valid_xyzu is not None and (now - last_valid_detection_ts) <= TARGET_HOLD_S:
                 battery_detected = True
                 hold_detection = True
-            
+
             if battery_detected:
-                # Resetear el contador cuando se detecta baterÃ­a
                 no_battery_since = None
                 stop_sent = False
             else:
-                # Iniciar contador si es la primera vez sin baterÃ­a
                 if no_battery_since is None:
                     no_battery_since = time.time()
-                    print(f"BaterÃ­a no detectada, esperando {NO_BATTERY_STOP_DELAY_S:.0f} segundos antes de enviar STOP...")
-                
-                # Enviar STOP despuÃ©s del tiempo configurado sin baterÃ­a
+                    print(f"Bateria no detectada, esperando {NO_BATTERY_STOP_DELAY_S:.0f} segundos antes de enviar STOP...")
+
                 elapsed = time.time() - no_battery_since
                 if elapsed >= NO_BATTERY_STOP_DELAY_S and not stop_sent:
-                    print(f"No se detectÃ³ baterÃ­a durante {elapsed:.1f} segundos. Enviando STOP...")
+                    print(f"No se detecto bateria durante {elapsed:.1f} segundos. Enviando STOP...")
                     robot_status = send_robot_action(robot, "STOP", STOP, args.pulse)
                     append_attempt_log(status="FAIL", reason="sin_deteccion_timeout")
                     stop_sent = True
@@ -1057,10 +1078,9 @@ def main() -> int:
                 else:
                     obj0 = target_obj
                     if obj0 is None:
-                        continue
-                    curr_class = str(obj0.get("class", "desconocido"))
-
-                    if curr_class.strip().lower() in BATTERY_CLASS_NAMES:
+                        pass
+                    elif str(obj0.get("class", "")).strip().lower() in BATTERY_CLASS_NAMES:
+                        curr_class = str(obj0.get("class", "desconocido"))
                         curr_center = obj0.get("center", (0.0, 0.0))
 
                         if USE_EDGE_REFINEMENT:
@@ -1125,98 +1145,101 @@ def main() -> int:
                                 fixed_homography = None
                                 fixed_homography_src_pts = None
                                 homography_status = HOMOGRAPHY_STATUS_OFF
-                                if mesa_idx is None:
-                                    continue
-                                x_mm, y_mm = compute_xy_robot_from_table_detection(
-                                    result,
-                                    mesa_idx,
-                                    smooth_center,
-                                )
+                                if mesa_idx is not None:
+                                    x_mm, y_mm = compute_xy_robot_from_table_detection(
+                                        result,
+                                        mesa_idx,
+                                        smooth_center,
+                                    )
+                                else:
+                                    x_mm, y_mm = None, None
                         else:
                             x_mm, y_mm = compute_xy_robot_from_table_detection(
                                 result,
                                 mesa_idx,
                                 smooth_center,
                             )
-                        x_mm, y_mm = apply_camera_xy_offset(
-                            x_mm,
-                            y_mm,
-                            args.x_offset_mm,
-                            args.y_offset_mm,
-                        )
 
-                        if last_valid_xyzu is not None:
-                            dx = abs(float(x_mm) - float(last_valid_xyzu[0]))
-                            dy = abs(float(y_mm) - float(last_valid_xyzu[1]))
-                            if dx < 0.5 and dy < 0.5:
-                                x_mm = float(last_valid_xyzu[0])
-                                y_mm = float(last_valid_xyzu[1])
-
-                        x_mm_live = x_mm
-                        y_mm_live = y_mm
-
-                        # U se trabaja y se muestra en absoluto 0..360, sin signo.
-                        u_deg_send = normalize_deg_360(stable_u + u_deg_bias)
-                        u_word_live = angle_deg_to_word(u_deg_send)
-                        xyzu = (x_mm, y_mm, Z_MM_CONST, u_deg_send)
-
-                        if len(orientation_samples) < min_orientation_samples:
-                            robot_status = (
-                                f"ROBOT: midiendo orientacion {len(orientation_samples)}/{orientation_window}"
-                            )
+                        if x_mm is None or y_mm is None:
+                            pass
                         else:
-                            last_valid_xyzu = xyzu
-                            last_valid_detection_ts = now
+                            x_mm, y_mm = apply_camera_xy_offset(
+                                x_mm,
+                                y_mm,
+                                args.x_offset_mm,
+                                args.y_offset_mm,
+                            )
 
-                        if robot is not None and now >= robot_backoff_until and (now - last_sent_ts) >= args.send_period:
-                            should_send_xyzu = False
-                            if last_sent_xyzu is None:
-                                should_send_xyzu = True
-                            elif pose_changed_enough(last_sent_xyzu, xyzu, args.send_delta_mm, args.send_delta_deg):
-                                should_send_xyzu = True
+                            if last_valid_xyzu is not None:
+                                dx = abs(float(x_mm) - float(last_valid_xyzu[0]))
+                                dy = abs(float(y_mm) - float(last_valid_xyzu[1]))
+                                if dx < 0.5 and dy < 0.5:
+                                    x_mm = float(last_valid_xyzu[0])
+                                    y_mm = float(last_valid_xyzu[1])
 
-                            if should_send_xyzu:
-                                try:
-                                    robot.write_pose_robot_mm_deg(*xyzu)
-                                    last_sent_xyzu = xyzu
-                                    last_sent_ts = now
-                                    robot_status = "ROBOT: words OK (live)"
-                                    should_log_ok = False
-                                    if last_attempt_log_xyzu is None:
-                                        should_log_ok = True
-                                    elif attempt_log_changed_enough(last_attempt_log_xyzu, xyzu):
-                                        should_log_ok = True
-                                    elif (now - last_attempt_log_ts) >= ATTEMPT_LOG_MIN_PERIOD_S:
-                                        should_log_ok = True
+                            x_mm_live = x_mm
+                            y_mm_live = y_mm
 
-                                    if should_log_ok:
+                            u_deg_send = normalize_deg_360(stable_u + u_deg_bias)
+                            u_word_live = angle_deg_to_word(u_deg_send)
+                            xyzu = (x_mm, y_mm, Z_MM_CONST, u_deg_send)
+
+                            if len(orientation_samples) < min_orientation_samples:
+                                robot_status = (
+                                    f"ROBOT: midiendo orientacion {len(orientation_samples)}/{orientation_window}"
+                                )
+                            else:
+                                last_valid_xyzu = xyzu
+                                last_valid_detection_ts = now
+
+                            if robot is not None and now >= robot_backoff_until and (now - last_sent_ts) >= args.send_period:
+                                should_send_xyzu = False
+                                if last_sent_xyzu is None:
+                                    should_send_xyzu = True
+                                elif pose_changed_enough(last_sent_xyzu, xyzu, args.send_delta_mm, args.send_delta_deg):
+                                    should_send_xyzu = True
+
+                                if should_send_xyzu:
+                                    try:
+                                        robot.write_pose_robot_mm_deg(*xyzu)
+                                        last_sent_xyzu = xyzu
+                                        last_sent_ts = now
+                                        robot_status = "ROBOT: words OK (live)"
+                                        should_log_ok = False
+                                        if last_attempt_log_xyzu is None:
+                                            should_log_ok = True
+                                        elif attempt_log_changed_enough(last_attempt_log_xyzu, xyzu):
+                                            should_log_ok = True
+                                        elif (now - last_attempt_log_ts) >= ATTEMPT_LOG_MIN_PERIOD_S:
+                                            should_log_ok = True
+
+                                        if should_log_ok:
+                                            append_attempt_log(
+                                                status="OK",
+                                                reason="words_enviadas",
+                                                x_mm=x_mm,
+                                                y_mm=y_mm,
+                                                z_mm=Z_MM_CONST,
+                                                u_deg=u_deg_send,
+                                            )
+                                            last_attempt_log_xyzu = xyzu
+                                            last_attempt_log_ts = now
+                                    except Exception as exc:
+                                        print(
+                                            f"[ROBOT WORDS ERROR] X={x_mm:.2f} Y={y_mm:.2f} "
+                                            f"Z={Z_MM_CONST:.3f} U_send={u_deg_send:.2f} WU={u_word_live} "
+                                            f"-> {type(exc).__name__}: {exc}"
+                                        )
+                                        robot_status = f"ROBOT ERROR words: {type(exc).__name__}"
                                         append_attempt_log(
-                                            status="OK",
-                                            reason="words_enviadas",
+                                            status="FAIL",
+                                            reason=f"words_error_{type(exc).__name__}",
                                             x_mm=x_mm,
                                             y_mm=y_mm,
                                             z_mm=Z_MM_CONST,
                                             u_deg=u_deg_send,
                                         )
-                                        last_attempt_log_xyzu = xyzu
-                                        last_attempt_log_ts = now
-                                except Exception as exc:
-                                    print(
-                                        f"[ROBOT WORDS ERROR] X={x_mm:.2f} Y={y_mm:.2f} "
-                                        f"Z={Z_MM_CONST:.3f} U_send={u_deg_send:.2f} WU={u_word_live} "
-                                        f"-> {type(exc).__name__}: {exc}"
-                                    )
-                                    robot_status = f"ROBOT ERROR words: {type(exc).__name__}"
-                                    append_attempt_log(
-                                        status="FAIL",
-                                        reason=f"words_error_{type(exc).__name__}",
-                                        x_mm=x_mm,
-                                        y_mm=y_mm,
-                                        z_mm=Z_MM_CONST,
-                                        u_deg=u_deg_send,
-                                    )
-                                    # Evita saturar el robot con reintentos inmediatos tras timeout.
-                                    robot_backoff_until = now + 1.0
+                                        robot_backoff_until = now + 1.0
 
             annotated = draw_panel(
                 annotated,
@@ -1254,83 +1277,168 @@ def main() -> int:
                 cv2.LINE_AA,
             )
 
+            # Dibuja puntos de calibracion manual
+            if manual_calib_mode:
+                for idx, (px, py) in enumerate(manual_points_px):
+                    if idx < len(MANUAL_ROBOT_POINTS):
+                        rx, ry = MANUAL_ROBOT_POINTS[idx]
+                        cv2.circle(annotated, (int(px), int(py)), 6, (0, 255, 255), 2)
+                        cv2.putText(annotated, f"({rx:.1f},{ry:.1f})", (int(px) + 8, int(py) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+                cv2.putText(annotated, f"CALIBRACION MANUAL: {len(manual_points_px)} puntos", (14, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                if manual_homography is not None:
+                    cv2.putText(annotated, f"Homografia OK | Error: {manual_homography_error:.2f} mm", (14, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                else:
+                    cv2.putText(annotated, "Agrega al menos 4 puntos", (14, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
+
             cv2.imshow("XYZU LIVE (click aqui para teclado)", annotated)
             key = cv2.waitKey(1) & 0xFF
 
             if key in (ord("q"), ord("Q")):
                 break
-            elif key in (ord("w"), ord("W")):
-                zoom = min(max_zoom, zoom + zoom_step)
-            elif key in (ord("s"), ord("S")):
-                zoom = max(1.0, zoom - zoom_step)
-            elif key == ord("0"):
-                zoom = 1.0
 
-            elif key in (ord("r"), ord("R")):
-                u_deg_bias += U_STEP_DEG
-            elif key in (ord("f"), ord("F")):
-                u_deg_bias -= U_STEP_DEG
-            elif key in (ord("c"), ord("C")):
-                u_deg_bias = 0.0
-            elif key in (ord("d"), ord("D")):
-                show_diagnostics = not show_diagnostics
-                if not show_diagnostics:
-                    try:
-                        cv2.destroyWindow("DIAGNOSTICO CONTRASTE (D: on/off)")
-                    except cv2.error:
-                        pass
-            elif key in (ord("h"), ord("H")):
-                if mesa_idx is None:
-                    print("[WARN] No hay mesa detectada para capturar la homografia.")
-                else:
-                    homography, src_pts = compute_table_homography(result, mesa_idx)
-                    if homography is None or src_pts is None:
-                        print("[WARN] No se pudo calcular una homografia valida con la deteccion actual.")
+            # --- Modo calibracion manual ---
+            if key == ord("m"):
+                manual_calib_mode = not manual_calib_mode
+                manual_points_px.clear()
+                manual_homography = None
+                manual_homography_error = None
+                manual_last_click = None
+                manual_robot_idx = 0
+                print(f"[MANUAL CALIB] Modo {'ACTIVADO' if manual_calib_mode else 'DESACTIVADO'}.")
+                if manual_calib_mode:
+                    print("[MANUAL CALIB] Haz click en la imagen y presiona 'p' para agregar punto.")
+
+            if manual_calib_mode:
+                if key == ord("p") and manual_last_click is not None and len(manual_points_px) < len(MANUAL_ROBOT_POINTS):
+                    px, py = manual_last_click
+                    manual_points_px.append((px, py))
+                    print(f"[MANUAL CALIB] Punto agregado: pixel=({px},{py}) robot={MANUAL_ROBOT_POINTS[len(manual_points_px)-1]}")
+                    manual_last_click = None
+
+                # Calcular homografia si hay al menos 4 puntos
+                if len(manual_points_px) >= 4:
+                    src = np.array(manual_points_px, dtype=np.float32)
+                    dst = np.array(MANUAL_ROBOT_POINTS[:len(manual_points_px)], dtype=np.float32)
+                    H, mask = cv2.findHomography(src, dst, method=0)
+                    if H is not None:
+                        manual_homography = H
+                        reproj = cv2.perspectiveTransform(src.reshape(-1, 1, 2), H).reshape(-1, 2)
+                        error = np.linalg.norm(reproj - dst, axis=1)
+                        mean_error = np.mean(error)
+                        manual_homography_error = mean_error
+                        print("[MANUAL CALIB] Homografia calculada:")
+                        print(H)
+                        for i, (p, r, rep) in enumerate(zip(manual_points_px, MANUAL_ROBOT_POINTS, error)):
+                            print(f"  Punto {i+1}: pixel={p} robot={r} -> reproy={reproj[i]} | error={rep:.2f} mm")
+                        print(f"[MANUAL CALIB] Error medio de reproyeccion: {mean_error:.2f} mm")
                     else:
-                        try:
-                            save_fixed_homography_with_metadata(
-                                fixed_homography_path,
-                                homography,
-                                src_pts,
-                                current_homography_metadata,
-                            )
-                            fixed_homography = homography
-                            fixed_homography_src_pts = src_pts
-                            homography_status = HOMOGRAPHY_STATUS_ON
-                            homography_status_until = 0.0
-                            print(f"[INFO] Homografia fija activada: {fixed_homography_path.name}")
-                        except Exception as exc:
-                            print(f"[WARN] No se pudo guardar la homografia fija: {exc}")
-            elif key in (ord("x"), ord("X")):
-                try:
-                    delete_fixed_homography(fixed_homography_path)
-                    fixed_homography = None
-                    fixed_homography_src_pts = None
-                    homography_status = HOMOGRAPHY_STATUS_DELETED
-                    homography_status_until = time.time() + 2.0
-                except Exception as exc:
-                    print(f"[WARN] No se pudo borrar la homografia fija: {exc}")
+                        manual_homography = None
+                        manual_homography_error = None
 
-            elif key == ord("1"):
-                if last_target_center is not None:
-                    blocked_target_center = last_target_center
-                    blocked_target_until = time.time() + PICKED_TARGET_BLOCK_S
-                orientation_samples.clear()
-                last_compass = None
-                last_target_class = None
-                last_target_center = None
-                last_center_smoothed = None
-                last_u_smoothed = None
-                last_valid_xyzu = None
-                robot_status = send_robot_action(robot, "START", START, args.pulse)
-            elif key == ord("2"):
-                robot_status = send_robot_action(robot, "STOP", STOP, args.pulse)
-            elif key == ord("3"):
-                robot_status = send_robot_action(robot, "PAUSE", PAUSE, args.pulse)
-            elif key == ord("4"):
-                robot_status = send_robot_action(robot, "CONTINUE", CONTINUE, args.pulse)
-            elif key == ord("5"):
-                robot_status = send_robot_action(robot, "RESET", RESET, args.pulse)
+                # Guardar homografia manual con 'h'
+                if key == ord("h") and manual_homography is not None:
+                    payload = {
+                        "homography": manual_homography.tolist(),
+                        "src_pts": np.array(manual_points_px, dtype=np.float32).tolist(),
+                        "dst_pts_robot": np.array(MANUAL_ROBOT_POINTS[:len(manual_points_px)], dtype=np.float32).tolist(),
+                        "table_width_mm": TABLE_WIDTH_MM,
+                        "table_height_mm": TABLE_HEIGHT_MM,
+                        "zoom": zoom,
+                        "width": args.width,
+                        "height": args.height,
+                        "undistort": bool(args.undistort),
+                        "saved_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    with open(manual_homography_path, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, indent=2)
+                    print(f"[MANUAL CALIB] Homografia manual guardada en {manual_homography_path}")
+
+                # Borrar puntos/homografia manual con 'x'
+                if key == ord("x"):
+                    manual_points_px.clear()
+                    manual_homography = None
+                    manual_homography_error = None
+                    print("[MANUAL CALIB] Puntos y homografia manual borrados.")
+
+                # Usar homografia manual si existe
+                if manual_homography is not None:
+                    fixed_homography = manual_homography
+                    fixed_homography_src_pts = np.array(manual_points_px, dtype=np.float32)
+                    args.x_offset_mm = 0.0
+                    args.y_offset_mm = 0.0
+
+            else:
+                # --- Teclas fuera del modo calibracion manual ---
+                if key in (ord("w"), ord("W")):
+                    zoom = min(max_zoom, zoom + zoom_step)
+                elif key in (ord("s"), ord("S")):
+                    zoom = max(1.0, zoom - zoom_step)
+                elif key == ord("0"):
+                    zoom = 1.0
+                elif key in (ord("r"), ord("R")):
+                    u_deg_bias += U_STEP_DEG
+                elif key in (ord("f"), ord("F")):
+                    u_deg_bias -= U_STEP_DEG
+                elif key in (ord("c"), ord("C")):
+                    u_deg_bias = 0.0
+                elif key in (ord("d"), ord("D")):
+                    show_diagnostics = not show_diagnostics
+                    if not show_diagnostics:
+                        try:
+                            cv2.destroyWindow("DIAGNOSTICO CONTRASTE (D: on/off)")
+                        except cv2.error:
+                            pass
+                elif key in (ord("h"), ord("H")):
+                    if mesa_idx is None:
+                        print("[WARN] No hay mesa detectada para capturar la homografia.")
+                    else:
+                        homography, src_pts = compute_table_homography(result, mesa_idx)
+                        if homography is None or src_pts is None:
+                            print("[WARN] No se pudo calcular una homografia valida con la deteccion actual.")
+                        else:
+                            try:
+                                save_fixed_homography_with_metadata(
+                                    fixed_homography_path,
+                                    homography,
+                                    src_pts,
+                                    current_homography_metadata,
+                                )
+                                fixed_homography = homography
+                                fixed_homography_src_pts = src_pts
+                                homography_status = HOMOGRAPHY_STATUS_ON
+                                homography_status_until = 0.0
+                                print(f"[INFO] Homografia fija activada: {fixed_homography_path.name}")
+                            except Exception as exc:
+                                print(f"[WARN] No se pudo guardar la homografia fija: {exc}")
+                elif key in (ord("x"), ord("X")):
+                    try:
+                        delete_fixed_homography(fixed_homography_path)
+                        fixed_homography = None
+                        fixed_homography_src_pts = None
+                        homography_status = HOMOGRAPHY_STATUS_DELETED
+                        homography_status_until = time.time() + 2.0
+                    except Exception as exc:
+                        print(f"[WARN] No se pudo borrar la homografia fija: {exc}")
+                elif key == ord("1"):
+                    if last_target_center is not None:
+                        blocked_target_center = last_target_center
+                        blocked_target_until = time.time() + PICKED_TARGET_BLOCK_S
+                    orientation_samples.clear()
+                    last_compass = None
+                    last_target_class = None
+                    last_target_center = None
+                    last_center_smoothed = None
+                    last_u_smoothed = None
+                    last_valid_xyzu = None
+                    robot_status = send_robot_action(robot, "START", START, args.pulse)
+                elif key == ord("2"):
+                    robot_status = send_robot_action(robot, "STOP", STOP, args.pulse)
+                elif key == ord("3"):
+                    robot_status = send_robot_action(robot, "PAUSE", PAUSE, args.pulse)
+                elif key == ord("4"):
+                    robot_status = send_robot_action(robot, "CONTINUE", CONTINUE, args.pulse)
+                elif key == ord("5"):
+                    robot_status = send_robot_action(robot, "RESET", RESET, args.pulse)
 
     finally:
         if backend == "picamera2":

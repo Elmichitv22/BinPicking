@@ -32,7 +32,7 @@ def main() -> int:
 	try:
 		rf = Roboflow(api_key=api_key)
 		project = rf.workspace("josephs-workspace-gguso").project("pruebafinal-p1ezt")
-		version = project.version(1)
+		version = project.version(2)
 		location = version.download("yolov8")
 	except Exception as exc:
 		print("[ERROR] Fallo la descarga del dataset desde Roboflow.")
