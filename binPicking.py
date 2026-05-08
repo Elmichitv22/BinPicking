@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 from __future__ import annotations
 
+import struct
+import socket
 import sys
 import time
 import argparse
 import json
 import pickle
+import math
 from pathlib import Path
+
+# Dirección IP de la HMI
+HMI_IP = "192.168.250.11"  # Cambia aquí la IP real de la HMI si es diferente
 from typing import Optional, Tuple
 from datetime import datetime
 
@@ -21,8 +26,6 @@ from robot_io import EpsonModbusClient
 from vision import (
     apply_digital_zoom,
     default_model_path,
-    draw_center_orientation,
-    draw_detections,
     draw_table_workobject,
     DEFAULT_CAMERA_FPS,
     DEFAULT_CAMERA_HEIGHT,
@@ -33,12 +36,31 @@ from vision import (
     highgui_available,
     list_non_table_indices,
     open_video_source,
-    refine_instance_pose_from_edges,
     select_primary_table_index,
-    select_table_indices,
 )
 
 BATTERY_CLASS_NAMES = {"bateria", "battery"}
+TAB_CLASS_NAMES = {"pestana", "pestania", "tab"}
+TAB_BATTERY_EXPAND_PX = 20.0
+TAB_MATCH_MAX_DIST_PX = 80.0
+TAB_MIN_CONF = 0.30
+BATTERY_MIN_CONF = 0.40
+TAB_TO_BATTERY_MASK_MAX_DIST_PX = 25.0
+TAB_CENTER_TO_BATTERY_CENTER_MIN_DIST_PX = 5.0
+TAB_MAX_EDGE_DIST_PX = 25.0
+TAB_MIN_AXIS_PROJECTION_RATIO = 0.35
+TAB_MAX_PERP_DIST_RATIO = 0.45
+PAIR_SCORE_TAB_MASK_WEIGHT = 5.0
+PAIR_SCORE_CENTER_WEIGHT = 0.2
+PAIR_SCORE_CONF_WEIGHT = 40.0
+PICK_OVERLAP_MAX_IOU = 0.15
+PAIR_DEBUG_PERIOD_S = 0.5
+TABLE_EDGE_MARGIN_PX = 20.0
+DEBUG_PAIR_LINES = False
+FORCE_SELECT_NEAREST_TAB = False
+TAB_FORCE_MAX_DIST_PX = 80.0
+TAB_U_BIAS_DEG = 0.0
+BATTERY_AXIS_U_BIAS_DEG = 270.0
 
 START = 520 - 1
 STOP = 521 - 1
@@ -95,14 +117,60 @@ USE_EDGE_REFINEMENT = False
 Z_MM_CONST = 50
 
 U_STEP_DEG = 5.0
-DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parent / "camera_calibration.yaml"
+DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parent / "calibracion" / "camera_calibration.yaml"
 DEFAULT_FIXED_HOMOGRAPHY_PATH = Path(__file__).resolve().parent / "homography_table1.json"
 HOMOGRAPHY_STATUS_ON = "H-FIJA: ON"
 HOMOGRAPHY_STATUS_OFF = "H-FIJA: OFF"
 HOMOGRAPHY_STATUS_INVALID = "H-FIJA: INVALIDA"
 HOMOGRAPHY_STATUS_DELETED = "H-FIJA: borrada"
 
+def send_coords_to_hmi(
+    x_mm: float,
+    y_mm: float,
+    z_mm: float,
+    u_deg: float,
+    hmi_ip: str = HMI_IP,
+    port: int = 502,
+    unit_id: int = 1,
+    REG_X = 32,
+    REG_Y = 48,
+    REG_Z = 64,
+    REG_U = 80
+):
+    scale = 100
 
+    x = int(round(x_mm * scale)) & 0xFFFF
+    y = int(round(y_mm * scale)) & 0xFFFF
+    z = int(round(z_mm * scale)) & 0xFFFF
+    u = int(round((u_deg % 360.0) * scale)) & 0xFFFF
+
+    def write_one_register(register, value):
+        transaction_id = 1
+        protocol_id = 0
+        function_code = 6  # Write Single Register
+
+        body = struct.pack(">BHH", function_code, register, value)
+        header = struct.pack(">HHHB", transaction_id, protocol_id, len(body) + 1, unit_id)
+
+        frame = header + body
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect((hmi_ip, port))
+            s.sendall(frame)
+            s.recv(1024)
+
+    try:
+        write_one_register(REG_X, x)
+        write_one_register(REG_Y, y)
+        write_one_register(REG_Z, z)
+        write_one_register(REG_U, u)
+
+        print(f"[HMI] X={x_mm:.2f} Y={y_mm:.2f} Z={z_mm:.2f} U={u_deg:.2f} enviados a HMI")
+
+    except Exception as e:
+        print(f"[HMI] Error enviando coordenadas: {e}")
+        
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="XY live + U live (stable + bias) + Z constante + words live")
     p.add_argument("--model", default=str(default_model_path()))
@@ -264,6 +332,789 @@ def normalize_deg_180(angle: float) -> float:
 
 def normalize_deg_360(angle: float) -> float:
     return float(angle) % 360.0
+
+
+def select_nearest_tab(instances_info, battery_center):
+    best_tab = None
+    best_dist2 = float("inf")
+
+    for obj in instances_info:
+        cls = _normalize_class_name(obj.get("class", ""))
+        if cls not in TAB_CLASS_NAMES:
+            continue
+
+        tab_center = obj.get("center", None)
+        if tab_center is None:
+            continue
+
+        dx = float(tab_center[0]) - float(battery_center[0])
+        dy = float(tab_center[1]) - float(battery_center[1])
+        dist2 = dx * dx + dy * dy
+
+        if dist2 < best_dist2:
+            best_dist2 = dist2
+            best_tab = obj
+
+    if best_tab is None:
+        return None
+
+    if best_dist2 > TAB_MATCH_MAX_DIST_PX * TAB_MATCH_MAX_DIST_PX:
+        return None
+
+    return best_tab
+
+
+def tab_vector_to_robot_u_deg(battery_center, tab_center):
+    dx = float(tab_center[0]) - float(battery_center[0])
+    dy_img = float(tab_center[1]) - float(battery_center[1])
+
+    # En imagen OpenCV, Y crece hacia abajo.
+    # Para coordenadas tipo robot/mesa, Y debe crecer hacia arriba.
+    dy_robot = -dy_img
+
+    angle_deg = math.degrees(math.atan2(dy_robot, dx))
+    return normalize_deg_360(angle_deg + TAB_U_BIAS_DEG)
+
+
+def _normalize_class_name(name: str) -> str:
+    s = str(name).strip().lower()
+    s = s.replace("ÃƒÂ±", "ñ")
+    s = s.replace("Ã±", "ñ")
+    s = s.replace("ñ", "n")
+    return s
+
+
+def draw_clean_detections(
+    img,
+    result,
+    mesa_idx: Optional[int],
+    non_table_indices,
+    selected_battery_idx: Optional[int] = None,
+    selected_tab_idx: Optional[int] = None,
+    overlap_battery_indices=None,
+) -> any:
+    out = img
+    names = getattr(result, "names", {})
+    font_scale = 0.42
+    text_thickness = 1
+    overlap_battery_indices = overlap_battery_indices or set()
+
+    if mesa_idx is not None and mesa_idx >= 0 and mesa_idx < len(result.boxes):
+        b = result.boxes[mesa_idx]
+        xyxy = b.xyxy[0]
+        x1, y1, x2, y2 = [int(round(float(v))) for v in xyxy]
+        conf = float(b.conf[0]) if b.conf is not None else 0.0
+        cv2.rectangle(out, (x1, y1), (x2, y2), (160, 200, 255), 2)
+        cv2.putText(
+            out,
+            f"mesa {conf:.2f}",
+            (x1, max(18, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            (160, 200, 255),
+            text_thickness,
+            cv2.LINE_AA,
+        )
+
+    for idx in non_table_indices:
+        if idx < 0 or idx >= len(result.boxes):
+            continue
+
+        b = result.boxes[idx]
+        cls_id = int(b.cls[0]) if b.cls is not None else -1
+        cls_name = _normalize_class_name(names.get(cls_id, str(cls_id)))
+        if cls_name not in (BATTERY_CLASS_NAMES | TAB_CLASS_NAMES):
+            continue
+
+        xyxy = b.xyxy[0]
+        x1, y1, x2, y2 = [int(round(float(v))) for v in xyxy]
+        conf = float(b.conf[0]) if b.conf is not None else 0.0
+
+        if cls_name in BATTERY_CLASS_NAMES:
+            color = (0, 255, 0) if idx == selected_battery_idx else (0, 220, 0)
+            label = "bateria"
+            box_thickness = 3 if idx == selected_battery_idx else 2
+        else:
+            color = (0, 128, 255) if idx == selected_tab_idx else (0, 150, 255)
+            label = "pestana"
+            box_thickness = 3 if idx == selected_tab_idx else 2
+
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, box_thickness)
+        cv2.putText(
+            out,
+            f"{label} {conf:.2f}",
+            (x1, max(18, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale,
+            color,
+            text_thickness,
+            cv2.LINE_AA,
+        )
+
+    return out
+
+
+def _battery_axis_vector_toward_tab(result, battery_obj, tab_center) -> Tuple[np.ndarray, Tuple[float, float]]:
+    battery_center = battery_obj.get("center", None)
+    if battery_center is None:
+        raise ValueError("bateria sin centro")
+
+    cx = float(battery_center[0])
+    cy = float(battery_center[1])
+    axis = np.asarray([1.0, 0.0], dtype=np.float64)
+    has_axis = False
+
+    det_idx = int(battery_obj.get("det_idx", -1))
+    masks = getattr(result, "masks", None)
+    if masks is not None and masks.xy is not None and 0 <= det_idx < len(masks.xy):
+        pts = masks.xy[det_idx]
+        if pts is not None and len(pts) >= 3:
+            pts_arr = np.asarray(pts, dtype=np.float32)
+            rect = cv2.minAreaRect(pts_arr.reshape(-1, 1, 2))
+            box = cv2.boxPoints(rect).astype(np.float64)
+            edges = [box[(i + 1) % 4] - box[i] for i in range(4)]
+            lengths = [float(np.linalg.norm(e)) for e in edges]
+            if lengths:
+                long_edge = edges[int(np.argmax(lengths))]
+                norm = float(np.linalg.norm(long_edge))
+                if norm > 1e-9:
+                    axis = long_edge / norm
+                    has_axis = True
+
+    if not has_axis:
+        bbox = battery_obj.get("bbox", None)
+        if bbox is None and 0 <= det_idx < len(result.boxes):
+            xyxy = result.boxes[det_idx].xyxy[0]
+            bbox = [float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])]
+
+        if bbox is not None:
+            x1, y1, x2, y2 = [float(v) for v in bbox]
+            w = max(1e-6, x2 - x1)
+            h = max(1e-6, y2 - y1)
+            axis = np.asarray([1.0, 0.0], dtype=np.float64) if w >= h else np.asarray([0.0, 1.0], dtype=np.float64)
+
+    vtab = np.asarray([float(tab_center[0]) - cx, float(tab_center[1]) - cy], dtype=np.float64)
+    if float(np.dot(axis, vtab)) < 0.0:
+        axis = -axis
+
+    norm_axis = float(np.linalg.norm(axis))
+    if norm_axis <= 1e-9:
+        axis = np.asarray([1.0, 0.0], dtype=np.float64)
+    else:
+        axis = axis / norm_axis
+
+    return axis, (cx, cy)
+
+
+def battery_axis_u_from_tab(result, battery_obj, tab_center):
+    """
+    Devuelve el angulo de la bateria usando su eje principal,
+    orientado hacia el lado donde esta la pestana.
+    No usa el vector centro bateria -> centro pestana como orientacion final.
+    """
+    axis, _ = _battery_axis_vector_toward_tab(result, battery_obj, tab_center)
+    dx = float(axis[0])
+    dy_robot = -float(axis[1])
+    angle_axis_deg = math.degrees(math.atan2(dy_robot, dx))
+    return normalize_deg_360(angle_axis_deg + BATTERY_AXIS_U_BIAS_DEG)
+
+
+def point_inside_expanded_bbox(point, bbox, expand_px):
+    px, py = float(point[0]), float(point[1])
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    return (
+        px >= x1 - expand_px and px <= x2 + expand_px and
+        py >= y1 - expand_px and py <= y2 + expand_px
+    )
+
+
+def tab_inside_or_touching_battery_bbox(result, battery_obj, tab_obj):
+    battery_bbox = get_obj_bbox_from_result(result, battery_obj)
+    tab_center = tab_obj.get("center", None)
+
+    if battery_bbox is None or tab_center is None:
+        return False
+
+    px, py = float(tab_center[0]), float(tab_center[1])
+    x1, y1, x2, y2 = [float(v) for v in battery_bbox]
+
+    expand = TAB_BATTERY_EXPAND_PX
+
+    return (
+        px >= x1 - expand and
+        px <= x2 + expand and
+        py >= y1 - expand and
+        py <= y2 + expand
+    )
+
+
+def tab_center_inside_other_battery_bbox(result, instances_info, battery_obj, tab_obj):
+    tab_center = tab_obj.get("center", None)
+    if tab_center is None:
+        return False
+
+    px, py = float(tab_center[0]), float(tab_center[1])
+
+    for other in instances_info:
+        if other is battery_obj:
+            continue
+
+        cls = _normalize_class_name(other.get("class", ""))
+        if cls not in BATTERY_CLASS_NAMES:
+            continue
+
+        other_bbox = get_obj_bbox_from_result(result, other)
+        if other_bbox is None:
+            continue
+
+        x1, y1, x2, y2 = [float(v) for v in other_bbox]
+
+        expand = TAB_BATTERY_EXPAND_PX
+        if (
+            px >= x1 - expand and px <= x2 + expand and
+            py >= y1 - expand and py <= y2 + expand
+        ):
+            return True
+
+    return False
+
+
+def get_obj_bbox_from_result(result, obj):
+    bbox = obj.get("bbox", None)
+    if bbox is not None:
+        return [float(v) for v in bbox]
+
+    det_idx = int(obj.get("det_idx", -1))
+    if det_idx >= 0 and det_idx < len(result.boxes):
+        xyxy = result.boxes[det_idx].xyxy[0]
+        return [float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])]
+
+    return None
+
+
+def get_obj_mask_points(result, obj):
+    det_idx = int(obj.get("det_idx", -1))
+    masks = getattr(result, "masks", None)
+
+    if masks is None or masks.xy is None:
+        return None
+
+    if det_idx < 0 or det_idx >= len(masks.xy):
+        return None
+
+    pts = masks.xy[det_idx]
+    if pts is None or len(pts) < 3:
+        return None
+
+    return np.asarray(pts, dtype=np.float32)
+
+
+def point_to_bbox_distance(point, bbox):
+    px, py = float(point[0]), float(point[1])
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+
+    dx = max(x1 - px, 0.0, px - x2)
+    dy = max(y1 - py, 0.0, py - y2)
+
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def point_to_mask_contour_distance(point, contour_pts):
+    px, py = float(point[0]), float(point[1])
+    contour = np.asarray(contour_pts, dtype=np.float32).reshape(-1, 1, 2)
+    return abs(float(cv2.pointPolygonTest(contour, (px, py), True)))
+
+
+def bbox_iou(a, b):
+    ax1, ay1, ax2, ay2 = [float(v) for v in a]
+    bx1, by1, bx2, by2 = [float(v) for v in b]
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    inter = iw * ih
+
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+
+    union = area_a + area_b - inter
+    if union <= 1e-6:
+        return 0.0
+
+    return inter / union
+
+
+def battery_is_isolated(result, instances_info, battery_obj):
+    bbox_a = get_obj_bbox_from_result(result, battery_obj)
+    if bbox_a is None:
+        return True
+
+    for other in instances_info:
+        if other is battery_obj:
+            continue
+
+        cls = _normalize_class_name(other.get("class", ""))
+        if cls not in BATTERY_CLASS_NAMES:
+            continue
+
+        bbox_b = get_obj_bbox_from_result(result, other)
+        if bbox_b is None:
+            continue
+
+        if bbox_iou(bbox_a, bbox_b) > PICK_OVERLAP_MAX_IOU:
+            return False
+
+    return True
+
+
+def tab_is_closer_to_this_battery(result, instances_info, battery_obj, tab_obj):
+    tab_center = tab_obj.get("center", None)
+    if tab_center is None:
+        return False
+
+    this_mask = get_obj_mask_points(result, battery_obj)
+    this_bbox = get_obj_bbox_from_result(result, battery_obj)
+
+    if this_mask is not None:
+        this_dist = point_to_mask_contour_distance(tab_center, this_mask)
+    elif this_bbox is not None:
+        this_dist = point_to_bbox_distance(tab_center, this_bbox)
+    else:
+        return False
+
+    for other in instances_info:
+        if other is battery_obj:
+            continue
+
+        cls = _normalize_class_name(other.get("class", ""))
+        if cls not in BATTERY_CLASS_NAMES:
+            continue
+
+        other_mask = get_obj_mask_points(result, other)
+        other_bbox = get_obj_bbox_from_result(result, other)
+
+        if other_mask is not None:
+            other_dist = point_to_mask_contour_distance(tab_center, other_mask)
+        elif other_bbox is not None:
+            other_dist = point_to_bbox_distance(tab_center, other_bbox)
+        else:
+            continue
+
+        if other_dist + 3.0 < this_dist:
+            return False
+
+    return True
+
+
+def validate_tab_belongs_to_battery(result, battery_obj, tab_obj):
+    """
+    Valida que la pestana pertenezca a esta bateria.
+
+    Condiciones:
+    1. La pestana debe estar cerca del contorno/mascara de la bateria.
+    2. La pestana debe estar hacia uno de los extremos del eje largo de la bateria.
+    3. La pestana no debe estar demasiado desviada lateralmente del eje de la bateria.
+    """
+
+    battery_center = battery_obj.get("center", None)
+    tab_center = tab_obj.get("center", None)
+
+    if battery_center is None or tab_center is None:
+        return False
+
+    battery_bbox = get_obj_bbox_from_result(result, battery_obj)
+    if battery_bbox is None:
+        return False
+
+    try:
+        axis, axis_center = _battery_axis_vector_toward_tab(result, battery_obj, tab_center)
+    except Exception:
+        return False
+
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = np.linalg.norm(axis)
+    if norm <= 1e-6:
+        return False
+    axis = axis / norm
+
+    perp = np.asarray([-axis[1], axis[0]], dtype=np.float64)
+
+    bc = np.asarray([float(battery_center[0]), float(battery_center[1])], dtype=np.float64)
+    tc = np.asarray([float(tab_center[0]), float(tab_center[1])], dtype=np.float64)
+    v = tc - bc
+
+    x1, y1, x2, y2 = [float(vv) for vv in battery_bbox]
+    w = max(1.0, x2 - x1)
+    h = max(1.0, y2 - y1)
+    long_len = max(w, h)
+    short_len = min(w, h)
+
+    proj = abs(float(np.dot(v, axis)))
+    perp_dist = abs(float(np.dot(v, perp)))
+
+    if proj < long_len * TAB_MIN_AXIS_PROJECTION_RATIO:
+        return False
+
+    if perp_dist > short_len * TAB_MAX_PERP_DIST_RATIO:
+        return False
+
+    battery_mask_pts = get_obj_mask_points(result, battery_obj)
+    if battery_mask_pts is not None:
+        edge_dist = point_to_mask_contour_distance(tab_center, battery_mask_pts)
+    else:
+        edge_dist = point_to_bbox_distance(tab_center, battery_bbox)
+
+    if edge_dist > TAB_MAX_EDGE_DIST_PX:
+        return False
+
+    return True
+
+
+def battery_inside_table_safe_zone(result, mesa_idx, battery_obj):
+    if mesa_idx is None:
+        return True
+
+    battery_center = battery_obj.get("center", None)
+    if battery_center is None:
+        return False
+
+    table_bbox = get_obj_bbox_from_result(result, {"det_idx": mesa_idx})
+    if table_bbox is None:
+        return True
+
+    px, py = float(battery_center[0]), float(battery_center[1])
+    x1, y1, x2, y2 = table_bbox
+
+    return (
+        px >= x1 + TABLE_EDGE_MARGIN_PX and
+        px <= x2 - TABLE_EDGE_MARGIN_PX and
+        py >= y1 + TABLE_EDGE_MARGIN_PX and
+        py <= y2 - TABLE_EDGE_MARGIN_PX
+    )
+
+
+def get_candidate_tabs_for_battery(result, instances_info, battery_obj, reject_events=None):
+    candidates = []
+
+    battery_center = battery_obj.get("center", None)
+    battery_bbox = get_obj_bbox_from_result(result, battery_obj)
+    battery_mask_pts = get_obj_mask_points(result, battery_obj)
+
+    if battery_center is None or battery_bbox is None:
+        return candidates
+
+    for obj in instances_info:
+        cls = _normalize_class_name(obj.get("class", ""))
+        if cls not in TAB_CLASS_NAMES:
+            continue
+
+        tab_conf = float(obj.get("conf", 0.0))
+        if tab_conf < TAB_MIN_CONF:
+            continue
+
+        tab_center = obj.get("center", None)
+        if tab_center is None:
+            continue
+
+        if not tab_inside_or_touching_battery_bbox(result, battery_obj, obj):
+            if reject_events is not None:
+                reject_events.append("pestana rechazada: fuera del bbox de su bateria")
+            continue
+
+        if tab_center_inside_other_battery_bbox(result, instances_info, battery_obj, obj):
+            if reject_events is not None:
+                reject_events.append("pestana rechazada: pertenece a otra bateria")
+            continue
+
+        dx = float(tab_center[0]) - float(battery_center[0])
+        dy = float(tab_center[1]) - float(battery_center[1])
+        center_dist = math.sqrt(dx * dx + dy * dy)
+
+        if center_dist < TAB_CENTER_TO_BATTERY_CENTER_MIN_DIST_PX:
+            continue
+
+        if center_dist > TAB_MATCH_MAX_DIST_PX:
+            continue
+
+        valid_geom = validate_tab_belongs_to_battery(result, battery_obj, obj)
+        closer_this = tab_is_closer_to_this_battery(result, instances_info, battery_obj, obj)
+
+        if not closer_this:
+            if reject_events is not None:
+                reject_events.append("pestana rechazada: mas cerca de otra bateria")
+            continue
+
+        penalty = 0.0
+        if not valid_geom:
+            penalty += 80.0
+            if reject_events is not None:
+                reject_events.append("pestana candidata penalizada: edge/proj/perp")
+
+        if battery_mask_pts is not None:
+            edge_dist = point_to_mask_contour_distance(tab_center, battery_mask_pts)
+            if edge_dist > TAB_TO_BATTERY_MASK_MAX_DIST_PX:
+                if reject_events is not None:
+                    reject_events.append(f"pestana rechazada: edge_dist={edge_dist:.2f}")
+                continue
+        else:
+            edge_dist = point_to_bbox_distance(tab_center, battery_bbox)
+            if edge_dist > TAB_BATTERY_EXPAND_PX:
+                if reject_events is not None:
+                    reject_events.append(f"pestana rechazada: bbox_dist={edge_dist:.2f}")
+                continue
+
+        try:
+            axis, _ = _battery_axis_vector_toward_tab(result, battery_obj, tab_center)
+            axis = np.asarray(axis, dtype=np.float64)
+            axis = axis / max(np.linalg.norm(axis), 1e-6)
+            perp = np.asarray([-axis[1], axis[0]], dtype=np.float64)
+            bc = np.asarray([float(battery_center[0]), float(battery_center[1])], dtype=np.float64)
+            tc = np.asarray([float(tab_center[0]), float(tab_center[1])], dtype=np.float64)
+            v_axis = tc - bc
+            proj = abs(float(np.dot(v_axis, axis)))
+            perp_dist = abs(float(np.dot(v_axis, perp)))
+        except Exception:
+            proj = 0.0
+            perp_dist = center_dist
+
+        score = (
+            perp_dist * 4.0
+            - proj * 1.2
+            + edge_dist * 2.0
+            + center_dist * 0.03
+            - tab_conf * 80.0
+            + penalty
+        )
+
+        candidates.append((obj, score, edge_dist, center_dist, tab_conf))
+
+    return candidates
+
+
+def force_best_axis_tab_for_battery(result, instances_info, battery_obj):
+    battery_center = battery_obj.get("center", None)
+    if battery_center is None:
+        return None
+
+    battery_bbox = get_obj_bbox_from_result(result, battery_obj)
+    if battery_bbox is None:
+        return None
+
+    try:
+        dummy_tab = (float(battery_center[0]) + 100.0, float(battery_center[1]))
+        axis, _ = _battery_axis_vector_toward_tab(result, battery_obj, dummy_tab)
+    except Exception:
+        x1, y1, x2, y2 = [float(v) for v in battery_bbox]
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+        axis = np.asarray([1.0, 0.0], dtype=np.float64) if w >= h else np.asarray([0.0, 1.0], dtype=np.float64)
+
+    axis = np.asarray(axis, dtype=np.float64)
+    norm = np.linalg.norm(axis)
+    if norm <= 1e-6:
+        return None
+    axis = axis / norm
+
+    perp = np.asarray([-axis[1], axis[0]], dtype=np.float64)
+
+    bc = np.asarray([float(battery_center[0]), float(battery_center[1])], dtype=np.float64)
+
+    x1, y1, x2, y2 = [float(v) for v in battery_bbox]
+    w = max(1.0, x2 - x1)
+    h = max(1.0, y2 - y1)
+    long_len = max(w, h)
+    short_len = min(w, h)
+
+    best_tab = None
+    best_score = float("inf")
+
+    for obj in instances_info:
+        cls = _normalize_class_name(obj.get("class", ""))
+        if cls not in TAB_CLASS_NAMES:
+            continue
+
+        tab_conf = float(obj.get("conf", 0.0))
+        if tab_conf < TAB_MIN_CONF:
+            continue
+
+        tab_center = obj.get("center", None)
+        if tab_center is None:
+            continue
+
+        if not tab_inside_or_touching_battery_bbox(result, battery_obj, obj):
+            continue
+
+        if tab_center_inside_other_battery_bbox(result, instances_info, battery_obj, obj):
+            continue
+
+        if not tab_is_closer_to_this_battery(result, instances_info, battery_obj, obj):
+            continue
+
+        tc = np.asarray([float(tab_center[0]), float(tab_center[1])], dtype=np.float64)
+        v = tc - bc
+
+        center_dist = float(np.linalg.norm(v))
+        if center_dist > TAB_FORCE_MAX_DIST_PX:
+            continue
+
+        proj = abs(float(np.dot(v, axis)))
+        perp_dist = abs(float(np.dot(v, perp)))
+
+        end_penalty = 0.0
+        if proj < long_len * 0.25:
+            end_penalty += 80.0
+
+        lateral_penalty = 0.0
+        if perp_dist > short_len * 0.75:
+            lateral_penalty += 100.0
+
+        battery_mask_pts = get_obj_mask_points(result, battery_obj)
+        if battery_mask_pts is not None:
+            edge_dist = point_to_mask_contour_distance(tab_center, battery_mask_pts)
+            if edge_dist > TAB_TO_BATTERY_MASK_MAX_DIST_PX:
+                continue
+        else:
+            edge_dist = point_to_bbox_distance(tab_center, battery_bbox)
+            if edge_dist > TAB_BATTERY_EXPAND_PX:
+                continue
+
+        score = (
+            perp_dist * 4.0
+            - proj * 1.2
+            + edge_dist * 2.0
+            + center_dist * 0.03
+            - tab_conf * 80.0
+            + end_penalty
+            + lateral_penalty
+        )
+
+        if score < best_score:
+            best_score = score
+            best_tab = obj
+
+    return best_tab
+
+
+def match_tab_for_battery(result, instances_info, battery_obj, reject_events=None):
+    candidates = get_candidate_tabs_for_battery(
+        result,
+        instances_info,
+        battery_obj,
+        reject_events=reject_events,
+    )
+
+    if not candidates:
+        if FORCE_SELECT_NEAREST_TAB:
+            tab = force_best_axis_tab_for_battery(result, instances_info, battery_obj)
+            if tab is not None:
+                if reject_events is not None:
+                    reject_events.append("fallback: pestana por eje/extremo")
+                tab_fallback = dict(tab)
+                tab_fallback["__fallback__"] = True
+                return tab_fallback
+        return None
+
+    best_tab, best_score, edge_dist, center_dist, tab_conf = min(
+        candidates,
+        key=lambda item: float(item[1])
+    )
+
+    return best_tab
+
+
+def score_battery_tab_pair(result, battery, tab):
+    battery_center = battery.get("center", None)
+    tab_center = tab.get("center", None)
+
+    if battery_center is None or tab_center is None:
+        return float("inf")
+
+    if not tab_inside_or_touching_battery_bbox(result, battery, tab):
+        return float("inf")
+
+    battery_conf = float(battery.get("conf", 0.0))
+    tab_conf = float(tab.get("conf", 0.0))
+
+    dx = float(tab_center[0]) - float(battery_center[0])
+    dy = float(tab_center[1]) - float(battery_center[1])
+    center_dist = math.sqrt(dx * dx + dy * dy)
+
+    battery_bbox = get_obj_bbox_from_result(result, battery)
+    battery_mask_pts = get_obj_mask_points(result, battery)
+    if battery_mask_pts is not None:
+        edge_dist = point_to_mask_contour_distance(tab_center, battery_mask_pts)
+    else:
+        edge_dist = point_to_bbox_distance(tab_center, battery_bbox) if battery_bbox is not None else 999.0
+
+    return (
+        edge_dist * 8.0
+        + center_dist * 0.05
+        - battery_conf * 30.0
+        - tab_conf * 60.0
+    )
+
+
+def build_battery_tab_pairs(result, instances_info, mesa_idx, reject_events=None):
+    pairs = []
+
+    for battery in instances_info:
+        cls = _normalize_class_name(battery.get("class", ""))
+        if cls not in BATTERY_CLASS_NAMES:
+            continue
+
+        if float(battery.get("conf", 0.0)) < BATTERY_MIN_CONF:
+            continue
+
+        # Evita unir piezas cuando dos baterias aparecen fusionadas/solapadas.
+        if not battery_is_isolated(result, instances_info, battery):
+            if reject_events is not None:
+                reject_events.append("bateria rechazada: muy cerca/solapada con otra")
+            continue
+
+        # Permisivo: no descartar por borde de mesa en este modo.
+
+        tab = match_tab_for_battery(result, instances_info, battery, reject_events=reject_events)
+        if tab is None:
+            continue
+
+        pair_score = score_battery_tab_pair(result, battery, tab)
+        if not math.isfinite(pair_score):
+            continue
+        pairs.append((battery, tab, pair_score))
+
+    return pairs
+
+
+def select_stable_battery_tab_pair(pairs, last_center):
+    if not pairs:
+        return None, None
+
+    if last_center is not None:
+        best_pair = None
+        best_dist2 = float("inf")
+
+        for battery, tab, score in pairs:
+            c = battery.get("center", None)
+            if c is None:
+                continue
+
+            dx = float(c[0]) - float(last_center[0])
+            dy = float(c[1]) - float(last_center[1])
+            dist2 = dx * dx + dy * dy
+
+            if dist2 < best_dist2:
+                best_dist2 = dist2
+                best_pair = (battery, tab)
+
+        if best_pair is not None and best_dist2 <= TARGET_MATCH_MAX_DIST_PX * TARGET_MATCH_MAX_DIST_PX:
+            return best_pair
+
+    best = min(pairs, key=lambda pair: float(pair[2]))
+    return best[0], best[1]
 
 
 def circular_median_deg(samples: list[float]) -> float:
@@ -607,7 +1458,7 @@ def select_stable_battery_target(
 ) -> Optional[dict]:
     battery_candidates = [
         obj for obj in instances_info
-        if str(obj.get("class", "")).strip().lower() in BATTERY_CLASS_NAMES
+        if _normalize_class_name(obj.get("class", "")) in BATTERY_CLASS_NAMES
     ]
     if blocked_center is not None and blocked_radius_px > 0.0:
         filtered_candidates = []
@@ -964,6 +1815,7 @@ def main() -> int:
     robot_backoff_until = 0.0
     last_attempt_log_xyzu: Optional[Tuple[float, float, float, float]] = None
     last_attempt_log_ts = 0.0
+    last_pair_debug_ts = 0.0
 
     last_compass: Optional[float] = None
     last_target_class: Optional[str] = None
@@ -1020,29 +1872,134 @@ def main() -> int:
             result = results[0]
 
             mesa_idx = select_primary_table_index(result)
-            mesa_indices = select_table_indices(result)
             non_table_indices = list_non_table_indices(result)
 
-            annotated = draw_detections(frame, result, non_table_indices, mesa_indices)
+            instances_info = extract_instances_info(result, indices=non_table_indices)
+            reject_events: list[str] = []
+            pairs = build_battery_tab_pairs(result, instances_info, mesa_idx, reject_events=reject_events)
+            target_obj, tab_obj = select_stable_battery_tab_pair(pairs, last_target_center)
+
+            overlap_battery_indices = set()
+
+            selected_battery_idx = int(target_obj.get("det_idx", -1)) if target_obj is not None else None
+            selected_tab_idx = int(tab_obj.get("det_idx", -1)) if tab_obj is not None else None
+            selected_pair_score = None
+            used_fallback_pair = False
+            if target_obj is not None and tab_obj is not None:
+                t_bat_idx = int(target_obj.get("det_idx", -1))
+                t_tab_idx = int(tab_obj.get("det_idx", -1))
+                used_fallback_pair = bool(tab_obj.get("__fallback__", False))
+                for battery, tab, pair_score in pairs:
+                    b_idx = int(battery.get("det_idx", -1))
+                    tb_idx = int(tab.get("det_idx", -1))
+                    if b_idx == t_bat_idx and tb_idx == t_tab_idx:
+                        selected_pair_score = float(pair_score)
+                        break
+
+            annotated = frame.copy()
+            annotated = draw_clean_detections(
+                annotated,
+                result,
+                mesa_idx,
+                non_table_indices,
+                selected_battery_idx=selected_battery_idx,
+                selected_tab_idx=selected_tab_idx,
+                overlap_battery_indices=overlap_battery_indices,
+            )
             annotated = draw_table_workobject(annotated, result, mesa_idx, fixed_pose=None)
 
-            instances_info = extract_instances_info(result, indices=non_table_indices)
-            annotated = draw_center_orientation(annotated, instances_info)
+            if DEBUG_PAIR_LINES:
+                for battery in instances_info:
+                    cls = _normalize_class_name(battery.get("class", ""))
+                    if cls not in BATTERY_CLASS_NAMES:
+                        continue
+
+                    c_bat = battery.get("center", None)
+                    if c_bat is None:
+                        continue
+
+                    candidates = get_candidate_tabs_for_battery(result, instances_info, battery)
+                    for tab, score, edge_dist, center_dist, tab_conf in candidates:
+                        c_tab = tab.get("center", None)
+                        if c_tab is None:
+                            continue
+
+                        cv2.line(
+                            annotated,
+                            (int(c_bat[0]), int(c_bat[1])),
+                            (int(c_tab[0]), int(c_tab[1])),
+                            (255, 180, 0),
+                            1,
+                            cv2.LINE_AA,
+                        )
+
+                        cv2.putText(
+                            annotated,
+                            f"{score:.1f}",
+                            (int(c_tab[0]) + 4, int(c_tab[1]) + 4),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.35,
+                            (255, 180, 0),
+                            1,
+                            cv2.LINE_AA,
+                        )
+
+                if target_obj is not None and tab_obj is not None:
+                    c_bat = target_obj.get("center", None)
+                    c_tab = tab_obj.get("center", None)
+                    if c_bat is not None and c_tab is not None:
+                        cv2.line(
+                            annotated,
+                            (int(c_bat[0]), int(c_bat[1])),
+                            (int(c_tab[0]), int(c_tab[1])),
+                            (255, 0, 0),
+                            2,
+                            cv2.LINE_AA,
+                        )
+                        cv2.circle(
+                            annotated,
+                            (int(c_tab[0]), int(c_tab[1])),
+                            9,
+                            (0, 140, 255),
+                            3,
+                            cv2.LINE_AA,
+                        )
+                        if selected_pair_score is not None:
+                            cv2.putText(
+                                annotated,
+                                f"sel {selected_pair_score:.1f}",
+                                (int(c_tab[0]) + 6, int(c_tab[1]) - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.40,
+                                (0, 140, 255),
+                                1,
+                                cv2.LINE_AA,
+                            )
 
             now = time.time()
-            active_blocked_center = blocked_target_center if now < blocked_target_until else None
-            target_obj = select_stable_battery_target(
-                instances_info,
-                last_target_center,
-                blocked_center=active_blocked_center,
-                blocked_radius_px=PICKED_TARGET_BLOCK_RADIUS_PX,
-            )
-            battery_detected = target_obj is not None
+            battery_detected = target_obj is not None and tab_obj is not None
             hold_detection = False
 
-            if not battery_detected and last_valid_xyzu is not None and (now - last_valid_detection_ts) <= TARGET_HOLD_S:
-                battery_detected = True
-                hold_detection = True
+            if (now - last_pair_debug_ts) >= PAIR_DEBUG_PERIOD_S:
+                num_bat = sum(1 for obj in instances_info if _normalize_class_name(obj.get("class", "")) in BATTERY_CLASS_NAMES)
+                num_tab = sum(1 for obj in instances_info if _normalize_class_name(obj.get("class", "")) in TAB_CLASS_NAMES)
+                sel_bat_center = target_obj.get("center", None) if target_obj is not None else None
+                sel_tab_center = tab_obj.get("center", None) if tab_obj is not None else None
+                print(
+                    "[PAIR DEBUG] "
+                    f"baterias={num_bat} pestanas={num_tab} parejas={len(pairs)} "
+                    f"score={selected_pair_score if selected_pair_score is not None else 'NA'} "
+                    f"bat_center={sel_bat_center} tab_center={sel_tab_center} "
+                    f"rejects={reject_events[:3]}"
+                )
+                last_pair_debug_ts = now
+
+            if not pairs:
+                robot_status = "ROBOT: buscando pieza valida"
+            elif target_obj is None or tab_obj is None:
+                robot_status = "ROBOT: sin pieza valida"
+            elif used_fallback_pair:
+                robot_status = "ROBOT: pieza seleccionada por fallback"
 
             if battery_detected:
                 no_battery_since = None
@@ -1079,30 +2036,17 @@ def main() -> int:
                     obj0 = target_obj
                     if obj0 is None:
                         pass
-                    elif str(obj0.get("class", "")).strip().lower() in BATTERY_CLASS_NAMES:
-                        curr_class = str(obj0.get("class", "desconocido"))
+                    elif _normalize_class_name(obj0.get("class", "")) in BATTERY_CLASS_NAMES:
+                        curr_class = _normalize_class_name(obj0.get("class", "desconocido"))
                         curr_center = obj0.get("center", (0.0, 0.0))
 
-                        if USE_EDGE_REFINEMENT:
-                            refined_center, refined_compass = refine_instance_pose_from_edges(
-                                frame,
-                                result,
-                                int(obj0.get("det_idx", -1)),
-                                (float(curr_center[0]), float(curr_center[1])),
-                                float(obj0.get("compass_bearing", 0.0)),
-                            )
-                        else:
-                            refined_center = (float(curr_center[0]), float(curr_center[1]))
-                            refined_compass = float(obj0.get("compass_bearing", 0.0))
-                        curr_center = refined_center
+                        curr_center = (float(curr_center[0]), float(curr_center[1]))
 
                         same_target = False
                         if last_target_class == curr_class and last_target_center is not None:
                             dx = float(curr_center[0]) - float(last_target_center[0])
                             dy = float(curr_center[1]) - float(last_target_center[1])
                             same_target = (dx * dx + dy * dy) <= (60.0 * 60.0)
-
-                        raw_compass = float(refined_compass) % 360.0
 
                         if not same_target:
                             orientation_samples.clear()
@@ -1117,22 +2061,74 @@ def main() -> int:
                         )
                         last_center_smoothed = smooth_center
 
-                        raw_compass = stabilize_compass_deg(raw_compass, last_compass)
-                        orientation_samples.append(raw_compass)
-                        if len(orientation_samples) > orientation_window:
-                            orientation_samples.pop(0)
+                        tab_center = tab_obj.get("center", None) if tab_obj is not None else None
 
-                        measured_u_raw = circular_median_deg(orientation_samples)
-                        stable_u_raw = measured_u_raw
+                        if tab_center is None:
+                            robot_status = "ROBOT: pestana no detectada"
+                            last_target_class = curr_class
+                            last_target_center = smooth_center
+                            stable_u = None
+                        else:
+                            raw_tab_u = battery_axis_u_from_tab(result, obj0, tab_center)
 
-                        u_smoothed = ema_angle_deg(stable_u_raw, last_u_smoothed, U_EMA_ALPHA)
-                        last_u_smoothed = u_smoothed
+                            orientation_samples.append(raw_tab_u)
+                            if len(orientation_samples) > orientation_window:
+                                orientation_samples.pop(0)
 
-                        stable_u = compass_bearing_to_robot_u(u_smoothed)
+                            measured_u_raw = circular_median_deg(orientation_samples)
+                            u_smoothed = ema_angle_deg(measured_u_raw, last_u_smoothed, U_EMA_ALPHA)
+                            last_u_smoothed = u_smoothed
 
-                        last_compass = stable_u_raw
-                        last_target_class = curr_class
-                        last_target_center = smooth_center
+                            stable_u = normalize_deg_360(u_smoothed)
+
+                            last_compass = measured_u_raw
+                            last_target_class = curr_class
+                            last_target_center = smooth_center
+
+                        c_bat = (int(smooth_center[0]), int(smooth_center[1]))
+                        cv2.circle(annotated, c_bat, 7, (0, 255, 0), 2)
+
+                        if tab_center is not None:
+                            c_tab = (int(tab_center[0]), int(tab_center[1]))
+                            u_diag_send = normalize_deg_360(stable_u + u_deg_bias) if stable_u is not None else None
+                            axis_vec, axis_center = _battery_axis_vector_toward_tab(result, obj0, tab_center)
+                            c_axis = (int(axis_center[0]), int(axis_center[1]))
+                            axis_len = 70
+                            c_axis_end = (
+                                int(round(axis_center[0] + float(axis_vec[0]) * axis_len)),
+                                int(round(axis_center[1] + float(axis_vec[1]) * axis_len)),
+                            )
+                            cv2.circle(annotated, c_tab, 7, (0, 128, 255), 2)
+                            cv2.line(annotated, c_bat, c_tab, (180, 180, 80), 2)
+                            cv2.arrowedLine(
+                                annotated,
+                                c_axis,
+                                c_axis_end,
+                                (0, 0, 255),
+                                3,
+                                tipLength=0.25,
+                            )
+                            cv2.putText(
+                                annotated,
+                                f"U={u_diag_send:.1f}" if u_diag_send is not None else "U=--",
+                                (c_bat[0] + 10, c_bat[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6,
+                                (255, 255, 255),
+                                2,
+                                cv2.LINE_AA,
+                            )
+                        else:
+                            cv2.putText(
+                                annotated,
+                                "SIN PESTANA",
+                                (c_bat[0] + 10, c_bat[1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.6,
+                                (0, 255, 255),
+                                2,
+                                cv2.LINE_AA,
+                            )
 
                         if fixed_homography is not None:
                             try:
@@ -1180,66 +2176,73 @@ def main() -> int:
                             x_mm_live = x_mm
                             y_mm_live = y_mm
 
-                            u_deg_send = normalize_deg_360(stable_u + u_deg_bias)
-                            u_word_live = angle_deg_to_word(u_deg_send)
-                            xyzu = (x_mm, y_mm, Z_MM_CONST, u_deg_send)
-
-                            if len(orientation_samples) < min_orientation_samples:
-                                robot_status = (
-                                    f"ROBOT: midiendo orientacion {len(orientation_samples)}/{orientation_window}"
-                                )
+                            if stable_u is None:
+                                x_mm_live = x_mm
+                                y_mm_live = y_mm
+                                robot_status = "ROBOT: bateria detectada, sin pestana"
                             else:
-                                last_valid_xyzu = xyzu
-                                last_valid_detection_ts = now
+                                u_deg_send = normalize_deg_360(stable_u + u_deg_bias)
+                                u_word_live = angle_deg_to_word(u_deg_send)
+                                xyzu = (x_mm, y_mm, Z_MM_CONST, u_deg_send)
 
-                            if robot is not None and now >= robot_backoff_until and (now - last_sent_ts) >= args.send_period:
-                                should_send_xyzu = False
-                                if last_sent_xyzu is None:
-                                    should_send_xyzu = True
-                                elif pose_changed_enough(last_sent_xyzu, xyzu, args.send_delta_mm, args.send_delta_deg):
-                                    should_send_xyzu = True
+                                if len(orientation_samples) < min_orientation_samples:
+                                    robot_status = (
+                                        f"ROBOT: midiendo orientacion {len(orientation_samples)}/{orientation_window}"
+                                    )
+                                else:
+                                    last_valid_xyzu = xyzu
+                                    last_valid_detection_ts = now
 
-                                if should_send_xyzu:
-                                    try:
-                                        robot.write_pose_robot_mm_deg(*xyzu)
-                                        last_sent_xyzu = xyzu
-                                        last_sent_ts = now
-                                        robot_status = "ROBOT: words OK (live)"
-                                        should_log_ok = False
-                                        if last_attempt_log_xyzu is None:
-                                            should_log_ok = True
-                                        elif attempt_log_changed_enough(last_attempt_log_xyzu, xyzu):
-                                            should_log_ok = True
-                                        elif (now - last_attempt_log_ts) >= ATTEMPT_LOG_MIN_PERIOD_S:
-                                            should_log_ok = True
+                                if robot is not None and now >= robot_backoff_until and (now - last_sent_ts) >= args.send_period:
+                                    should_send_xyzu = False
+                                    if last_sent_xyzu is None:
+                                        should_send_xyzu = True
+                                    elif pose_changed_enough(last_sent_xyzu, xyzu, args.send_delta_mm, args.send_delta_deg):
+                                        should_send_xyzu = True
 
-                                        if should_log_ok:
+                                    if should_send_xyzu:
+                                        try:
+                                            robot.write_pose_robot_mm_deg(*xyzu)
+                                            # Enviar también a la HMI
+                                            send_coords_to_hmi(xyzu[0], xyzu[1], xyzu[2], xyzu[3])
+                                            last_sent_xyzu = xyzu
+                                            last_sent_ts = now
+                                            robot_status = "ROBOT: words OK (live)"
+                                            should_log_ok = False
+                                            if last_attempt_log_xyzu is None:
+                                                should_log_ok = True
+                                            elif attempt_log_changed_enough(last_attempt_log_xyzu, xyzu):
+                                                should_log_ok = True
+                                            elif (now - last_attempt_log_ts) >= ATTEMPT_LOG_MIN_PERIOD_S:
+                                                should_log_ok = True
+
+                                            if should_log_ok:
+                                                append_attempt_log(
+                                                    status="OK",
+                                                    reason="words_enviadas",
+                                                    x_mm=x_mm,
+                                                    y_mm=y_mm,
+                                                    z_mm=Z_MM_CONST,
+                                                    u_deg=u_deg_send,
+                                                )
+                                                last_attempt_log_xyzu = xyzu
+                                                last_attempt_log_ts = now
+                                        except Exception as exc:
+                                            print(
+                                                f"[ROBOT WORDS ERROR] X={x_mm:.2f} Y={y_mm:.2f} "
+                                                f"Z={Z_MM_CONST:.3f} U_send={u_deg_send:.2f} WU={u_word_live} "
+                                                f"-> {type(exc).__name__}: {exc}"
+                                            )
+                                            robot_status = f"ROBOT ERROR words: {type(exc).__name__}"
                                             append_attempt_log(
-                                                status="OK",
-                                                reason="words_enviadas",
+                                                status="FAIL",
+                                                reason=f"words_error_{type(exc).__name__}",
                                                 x_mm=x_mm,
                                                 y_mm=y_mm,
                                                 z_mm=Z_MM_CONST,
                                                 u_deg=u_deg_send,
                                             )
-                                            last_attempt_log_xyzu = xyzu
-                                            last_attempt_log_ts = now
-                                    except Exception as exc:
-                                        print(
-                                            f"[ROBOT WORDS ERROR] X={x_mm:.2f} Y={y_mm:.2f} "
-                                            f"Z={Z_MM_CONST:.3f} U_send={u_deg_send:.2f} WU={u_word_live} "
-                                            f"-> {type(exc).__name__}: {exc}"
-                                        )
-                                        robot_status = f"ROBOT ERROR words: {type(exc).__name__}"
-                                        append_attempt_log(
-                                            status="FAIL",
-                                            reason=f"words_error_{type(exc).__name__}",
-                                            x_mm=x_mm,
-                                            y_mm=y_mm,
-                                            z_mm=Z_MM_CONST,
-                                            u_deg=u_deg_send,
-                                        )
-                                        robot_backoff_until = now + 1.0
+                                            robot_backoff_until = now + 1.0
 
             annotated = draw_panel(
                 annotated,

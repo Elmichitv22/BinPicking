@@ -156,18 +156,11 @@ def draw_pose(image: np.ndarray, pose: Optional[dict]) -> np.ndarray:
 
 def default_model_path() -> Path:
     """Busca best.pt del trainN mas reciente; si no existe usa yolov8n-seg.pt."""
-    runs_dir = ROOT_DIR / "runs" / "segment"
-    if runs_dir.exists():
-        train_dirs = sorted(
-            [d for d in runs_dir.iterdir() if d.is_dir() and d.name.startswith("train")],
-            key=lambda p: int(p.name[5:]) if len(p.name) > 5 and p.name[5:].isdigit() else 0,
-            reverse=True,
-        )
-        for train_dir in train_dirs:
-            best_pt = train_dir / "weights" / "best.pt"
-            if best_pt.exists():
-                return best_pt
-    return ROOT_DIR / "yolov8n-seg.pt"
+    # Ruta fija al modelo entrenado solicitado por el usuario
+    model_path = ROOT_DIR / "runs" / "segment" / "runs" / "segment" / "roboflow_v1" / "weights" / "best.pt"
+    if model_path.exists():
+        return model_path
+    return model_path  # Devuelve la ruta aunque no exista, para forzar error claro si falta
 
 
 def highgui_available() -> bool:
