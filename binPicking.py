@@ -85,11 +85,21 @@ DEFAULT_SPEED = 40
 
 HMI_SERVER_PORT = 1502
 
+
+
 HMI_START = 519
 HMI_STOP = 520
 HMI_PAUSE = 521
 HMI_CONTINUE = 522
 HMI_RESET = 523
+
+# Nuevos botones para control de motor
+HMI_MOTOR_ON = 533
+HMI_MOTOR_OFF = 534
+
+# Nuevos botones para control de motor
+HMI_MOTOR_ON = 533
+HMI_MOTOR_OFF = 534
 
 hmi_coils = {}
 hmi_lock = threading.Lock()
@@ -110,6 +120,8 @@ HMI_BUTTON_NAMES = {
     HMI_PAUSE: "PAUSE",
     HMI_CONTINUE: "CONTINUE",
     HMI_RESET: "RESET",
+    HMI_MOTOR_ON: "MOTOR ON",
+    HMI_MOTOR_OFF: "MOTOR OFF",
 }
 
 POSE_SCALE = 100.0
@@ -306,7 +318,9 @@ def _handle_hmi_modbus_request(data: bytes) -> bytes:
         btn_name = HMI_BUTTON_NAMES.get(coil_addr)
         if btn_name is not None:
             if coil_value == 1:
-                push_hmi_command(coil_addr)
+                # Solo ejecuta push_hmi_command para los botones válidos
+                if coil_addr in [HMI_START, HMI_STOP, HMI_PAUSE, HMI_CONTINUE, HMI_RESET, HMI_MOTOR_ON, HMI_MOTOR_OFF]:
+                    push_hmi_command(coil_addr)
                 print(f"[HMI CMD] {btn_name} recibido en ON")
             else:
                 print(f"[HMI CMD] {btn_name} liberado")
@@ -336,7 +350,8 @@ def _handle_hmi_modbus_request(data: bytes) -> bytes:
             btn_name = HMI_BUTTON_NAMES.get(addr)
             if btn_name is not None:
                 if bit_val == 1:
-                    push_hmi_command(addr)
+                    if addr in [HMI_START, HMI_STOP, HMI_PAUSE, HMI_CONTINUE, HMI_RESET, HMI_MOTOR_ON, HMI_MOTOR_OFF]:
+                        push_hmi_command(addr)
                     print(f"[HMI CMD] {btn_name} recibido en ON")
                 else:
                     print(f"[HMI CMD] {btn_name} liberado")
@@ -2466,6 +2481,7 @@ def main() -> int:
                 cv2.LINE_AA,
             )
 
+
             if pop_hmi_command(HMI_START):
                 print("[HMI CMD] Ejecutando START hacia robot")
                 robot_status = send_robot_action(robot, "START", START, args.pulse)
@@ -2486,10 +2502,55 @@ def main() -> int:
                 robot_status = send_robot_action(robot, "CONTINUE", CONTINUE, args.pulse)
                 print(robot_status)
 
+
             if pop_hmi_command(HMI_RESET):
                 print("[HMI CMD] Ejecutando RESET hacia robot")
                 robot_status = send_robot_action(robot, "RESET", RESET, args.pulse)
                 print(robot_status)
+
+            # MOTOR ON
+            if pop_hmi_command(HMI_MOTOR_ON):
+                print("[HMI CMD] Ejecutando MOTOR ON hacia robot")
+                robot_status = send_robot_action(robot, "MOTOR ON", HMI_MOTOR_ON, args.pulse)
+                print(robot_status)
+
+            # MOTOR OFF
+            if pop_hmi_command(HMI_MOTOR_OFF):
+                print("[HMI CMD] Ejecutando MOTOR OFF hacia robot")
+                robot_status = send_robot_action(robot, "MOTOR OFF", HMI_MOTOR_OFF, args.pulse)
+                print(robot_status)
+
+            # MOTOR ON
+            if pop_hmi_command(HMI_MOTOR_ON):
+                print("[HMI CMD] Ejecutando MOTOR ON hacia robot")
+                if robot is not None:
+                    try:
+                        robot.motor_on()
+                        robot_status = "ROBOT: Motor On enviado"
+                        print(robot_status)
+                    except AttributeError:
+                        print("[ROBOT MOTOR] EpsonClient no tiene motor_on(), usar método alternativo si existe")
+                    except Exception as exc:
+                        robot_status = f"ROBOT ERROR Motor On: {exc}"
+                        print(robot_status)
+                else:
+                    print("ROBOT: offline, Motor On omitido")
+
+            # MOTOR OFF
+            if pop_hmi_command(HMI_MOTOR_OFF):
+                print("[HMI CMD] Ejecutando MOTOR OFF hacia robot")
+                if robot is not None:
+                    try:
+                        robot.motor_off()
+                        robot_status = "ROBOT: Motor Off enviado"
+                        print(robot_status)
+                    except AttributeError:
+                        print("[ROBOT MOTOR] EpsonClient no tiene motor_off(), usar método alternativo si existe")
+                    except Exception as exc:
+                        robot_status = f"ROBOT ERROR Motor Off: {exc}"
+                        print(robot_status)
+                else:
+                    print("ROBOT: offline, Motor Off omitido")
 
             speed_value = pop_hmi_speed()
             if speed_value is not None and robot is not None:
