@@ -7505,3 +7505,4 @@ timestamp,status,reason,x_mm,y_mm,z_mm,u_deg
 2026-05-11T16:28:17,OK,words_enviadas,151.33,169.84,53.000,21.80
 2026-05-11T16:28:21,OK,words_enviadas,118.28,171.17,53.000,35.47
 2026-05-11T16:28:31,FAIL,sin_deteccion_timeout,,,,
+2026-05-11T16:50:45,FAIL,sin_deteccion_timeout,,,,
