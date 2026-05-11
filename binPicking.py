@@ -2,18 +2,25 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+# Controla si se muestran los prints de debug de parejas
+PAIR_DEBUG_ENABLED = False
+
+# Controla si se muestran los prints de lecturas Modbus (Function Code 03)
+HMI_DEBUG_READS = False
+
 import struct
 import socket
 import sys
 import time
+import threading
 import argparse
 import json
 import pickle
 import math
 from pathlib import Path
 
-# Dirección IP de la HMI
-HMI_IP = "192.168.250.11"  # Cambia aquí la IP real de la HMI si es diferente
+# DirecciÃƒÂ³n IP de la HMI
+HMI_IP = "192.168.250.11"  # Cambia aquÃƒÂ­ la IP real de la HMI si es diferente
 from typing import Optional, Tuple
 from datetime import datetime
 
@@ -72,6 +79,38 @@ REG_X = 32
 REG_Y = 48
 REG_Z = 64
 REG_U = 80
+REG_SPEED = 96
+
+DEFAULT_SPEED = 40
+
+HMI_SERVER_PORT = 1502
+
+HMI_START = 519
+HMI_STOP = 520
+HMI_PAUSE = 521
+HMI_CONTINUE = 522
+HMI_RESET = 523
+
+hmi_coils = {}
+hmi_lock = threading.Lock()
+
+hmi_registers = {}
+hmi_registers_lock = threading.Lock()
+
+hmi_pending_cmds = set()
+hmi_pending_lock = threading.Lock()
+
+hmi_speed_lock = threading.Lock()
+last_speed_sent_to_robot = None
+speed_pending = False
+
+HMI_BUTTON_NAMES = {
+    HMI_START: "START",
+    HMI_STOP: "STOP",
+    HMI_PAUSE: "PAUSE",
+    HMI_CONTINUE: "CONTINUE",
+    HMI_RESET: "RESET",
+}
 
 POSE_SCALE = 100.0
 TABLE_WIDTH_MM = 209.00
@@ -114,9 +153,8 @@ CENTER_EMA_ALPHA = 0.08
 U_EMA_ALPHA = 0.12
 USE_EDGE_REFINEMENT = False
 
-Z_MM_CONST = 50
+Z_MM_CONST = 53
 
-U_STEP_DEG = 5.0
 DEFAULT_CALIBRATION_PATH = Path(__file__).resolve().parent / "calibracion" / "camera_calibration.yaml"
 DEFAULT_FIXED_HOMOGRAPHY_PATH = Path(__file__).resolve().parent / "homography_table1.json"
 HOMOGRAPHY_STATUS_ON = "H-FIJA: ON"
@@ -124,52 +162,255 @@ HOMOGRAPHY_STATUS_OFF = "H-FIJA: OFF"
 HOMOGRAPHY_STATUS_INVALID = "H-FIJA: INVALIDA"
 HOMOGRAPHY_STATUS_DELETED = "H-FIJA: borrada"
 
+def set_hmi_coil(addr, value):
+    with hmi_lock:
+        hmi_coils[int(addr)] = 1 if int(value) else 0
+
+
+def get_hmi_coil(addr):
+    with hmi_lock:
+        return int(hmi_coils.get(int(addr), 0))
+
+
+def set_hmi_register(addr, value):
+    with hmi_registers_lock:
+        hmi_registers[int(addr)] = int(value) & 0xFFFF
+
+
+def get_hmi_register(addr):
+    with hmi_registers_lock:
+        return int(hmi_registers.get(int(addr), 0))
+
+
+def push_hmi_command(addr):
+    with hmi_pending_lock:
+        hmi_pending_cmds.add(int(addr))
+
+
+def pop_hmi_command(addr):
+    with hmi_pending_lock:
+        addr = int(addr)
+        if addr in hmi_pending_cmds:
+            hmi_pending_cmds.remove(addr)
+            return True
+        return False
+
+
+def set_hmi_speed(value):
+    global speed_pending
+    value = max(1, min(100, int(value)))
+    set_hmi_register(REG_SPEED, value)
+    with hmi_speed_lock:
+        speed_pending = True
+
+
+def pop_hmi_speed():
+    global speed_pending
+    with hmi_speed_lock:
+        if speed_pending:
+            speed_pending = False
+            return get_hmi_register(REG_SPEED)
+        return None
+
+
 def send_coords_to_hmi(
     x_mm: float,
     y_mm: float,
     z_mm: float,
     u_deg: float,
-    hmi_ip: str = HMI_IP,
-    port: int = 502,
-    unit_id: int = 1,
-    REG_X = 32,
-    REG_Y = 48,
-    REG_Z = 64,
-    REG_U = 80
 ):
-    scale = 100
+    x = int(round(x_mm * 100)) & 0xFFFF
+    y = int(round(y_mm * 100)) & 0xFFFF
+    z = int(round(z_mm * 100)) & 0xFFFF
+    u = int(round((u_deg % 360.0) * 100)) & 0xFFFF
 
-    x = int(round(x_mm * scale)) & 0xFFFF
-    y = int(round(y_mm * scale)) & 0xFFFF
-    z = int(round(z_mm * scale)) & 0xFFFF
-    u = int(round((u_deg % 360.0) * scale)) & 0xFFFF
+    set_hmi_register(REG_X, x)
+    set_hmi_register(REG_Y, y)
+    set_hmi_register(REG_Z, z)
+    set_hmi_register(REG_U, u)
 
-    def write_one_register(register, value):
-        transaction_id = 1
-        protocol_id = 0
-        function_code = 6  # Write Single Register
+    print(f"[HMI REG] X={x} Y={y} Z={z} U={u} disponibles para HMI")
 
-        body = struct.pack(">BHH", function_code, register, value)
-        header = struct.pack(">HHHB", transaction_id, protocol_id, len(body) + 1, unit_id)
 
-        frame = header + body
+def _recv_exact(conn: socket.socket, size: int) -> bytes:
+    data = b""
+    while len(data) < size:
+        chunk = conn.recv(size - len(data))
+        if not chunk:
+            return b""
+        data += chunk
+    return data
 
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(2)
-            s.connect((hmi_ip, port))
-            s.sendall(frame)
-            s.recv(1024)
 
-    try:
-        write_one_register(REG_X, x)
-        write_one_register(REG_Y, y)
-        write_one_register(REG_Z, z)
-        write_one_register(REG_U, u)
+def _build_modbus_response(transaction_id: int, protocol_id: int, unit_id: int, pdu: bytes) -> bytes:
+    length = len(pdu) + 1
+    mbap = struct.pack(">HHHB", transaction_id, protocol_id, length, unit_id)
+    return mbap + pdu
 
-        print(f"[HMI] X={x_mm:.2f} Y={y_mm:.2f} Z={z_mm:.2f} U={u_deg:.2f} enviados a HMI")
 
-    except Exception as e:
-        print(f"[HMI] Error enviando coordenadas: {e}")
+def _handle_hmi_modbus_request(data: bytes) -> bytes:
+    if len(data) < 8:
+        return b""
+
+    transaction_id, protocol_id, length, unit_id = struct.unpack(">HHHB", data[:7])
+    pdu = data[7:]
+    if len(pdu) < 1:
+        return b""
+
+    function_code = pdu[0]
+
+    if function_code == 3:
+        if len(data) < 12:
+            return b""
+        start_address = struct.unpack(">H", data[8:10])[0]
+        quantity = struct.unpack(">H", data[10:12])[0]
+        if HMI_DEBUG_READS:
+            print(f"[HMI SERVER] Read Holding Registers start={start_address} quantity={quantity}")
+
+        if quantity <= 0:
+            err_pdu = struct.pack(">BB", function_code | 0x80, 3)
+            return _build_modbus_response(transaction_id, protocol_id, unit_id, err_pdu)
+
+        registers = []
+        for i in range(quantity):
+            addr = start_address + i
+            val = get_hmi_register(addr)
+            registers.append(val)
+            if HMI_DEBUG_READS:
+                print(f"[HMI SERVER] HR {addr} = {val}")
+
+        byte_count = quantity * 2
+        resp_pdu = struct.pack(">BB", function_code, byte_count)
+        for val in registers:
+            resp_pdu += struct.pack(">H", val)
+        if HMI_DEBUG_READS:
+            print("[HMI SERVER] Respuesta enviada func 03")
+        return _build_modbus_response(transaction_id, protocol_id, unit_id, resp_pdu)
+
+    if function_code == 5:
+        if len(data) < 12:
+            return b""
+        coil_addr = struct.unpack(">H", data[8:10])[0]
+        raw_value = struct.unpack(">H", data[10:12])[0]
+
+        if raw_value == 0xFF00:
+            coil_value = 1
+        elif raw_value == 0x0000:
+            coil_value = 0
+        else:
+            err_pdu = struct.pack(">BB", function_code | 0x80, 3)
+            return _build_modbus_response(transaction_id, protocol_id, unit_id, err_pdu)
+
+        set_hmi_coil(coil_addr, coil_value)
+
+        btn_name = HMI_BUTTON_NAMES.get(coil_addr)
+        if btn_name is not None:
+            if coil_value == 1:
+                push_hmi_command(coil_addr)
+                print(f"[HMI CMD] {btn_name} recibido en ON")
+            else:
+                print(f"[HMI CMD] {btn_name} liberado")
+
+        resp_pdu = pdu[:5]
+        return _build_modbus_response(transaction_id, protocol_id, unit_id, resp_pdu)
+
+    if function_code == 15:
+        if len(pdu) < 6:
+            return b""
+
+        start_address = struct.unpack(">H", pdu[1:3])[0]
+        quantity = struct.unpack(">H", pdu[3:5])[0]
+        byte_count = pdu[5]
+        expected_bytes = 6 + byte_count
+        if len(pdu) < expected_bytes:
+            return b""
+
+        coil_bytes = pdu[6:6 + byte_count]
+        for i in range(quantity):
+            addr = start_address + i
+            byte_idx = i // 8
+            bit_idx = i % 8
+            bit_val = (coil_bytes[byte_idx] >> bit_idx) & 0x01
+            set_hmi_coil(addr, bit_val)
+
+            btn_name = HMI_BUTTON_NAMES.get(addr)
+            if btn_name is not None:
+                if bit_val == 1:
+                    push_hmi_command(addr)
+                    print(f"[HMI CMD] {btn_name} recibido en ON")
+                else:
+                    print(f"[HMI CMD] {btn_name} liberado")
+
+        resp_pdu = struct.pack(">BHH", function_code, start_address, quantity)
+        return _build_modbus_response(transaction_id, protocol_id, unit_id, resp_pdu)
+
+    if function_code == 6:
+        if len(data) < 12:
+            return b""
+        register_addr = struct.unpack(">H", data[8:10])[0]
+        register_value = struct.unpack(">H", data[10:12])[0]
+
+        if register_addr == REG_SPEED:
+            speed = max(1, min(100, int(register_value)))
+            set_hmi_speed(speed)
+            print(f"[HMI SPEED] Velocidad recibida desde HMI: {speed}")
+        else:
+            set_hmi_register(register_addr, register_value)
+
+        resp_pdu = struct.pack(">BHH", function_code, register_addr, register_value)
+        return _build_modbus_response(transaction_id, protocol_id, unit_id, resp_pdu)
+
+    err_pdu = struct.pack(">BB", function_code | 0x80, 1)
+    return _build_modbus_response(transaction_id, protocol_id, unit_id, err_pdu)
+
+
+def start_hmi_modbus_server(host="0.0.0.0", port=HMI_SERVER_PORT):
+    def _server_loop():
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind((host, int(port)))
+        except OSError as e:
+            import errno
+            if hasattr(e, 'errno') and e.errno == errno.EADDRINUSE:
+                print(f"[HMI SERVER] Puerto {port} ya estÃƒÂ¡ en uso. Cierra la otra ejecuciÃƒÂ³n de binPicking.py o libera el puerto.")
+                return
+            else:
+                raise
+        srv.listen(5)
+        print(f"[HMI SERVER] Escuchando en {host}:{port}")
+
+        while True:
+            conn, addr = srv.accept()
+            try:
+                while True:
+                    header = _recv_exact(conn, 7)
+                    if not header:
+                        break
+
+                    transaction_id, protocol_id, length, unit_id = struct.unpack(">HHHB", header)
+                    if length <= 1:
+                        break
+
+                    pdu = _recv_exact(conn, length - 1)
+                    if not pdu:
+                        break
+
+                    request = header + pdu
+                    response = _handle_hmi_modbus_request(request)
+                    if response:
+                        conn.sendall(response)
+            except Exception as exc:
+                print(f"[HMI SERVER] Error con cliente {addr}: {exc}")
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    thread = threading.Thread(target=_server_loop, daemon=True)
+    thread.start()
+    return thread
         
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="XY live + U live (stable + bias) + Z constante + words live")
@@ -378,9 +619,9 @@ def tab_vector_to_robot_u_deg(battery_center, tab_center):
 
 def _normalize_class_name(name: str) -> str:
     s = str(name).strip().lower()
-    s = s.replace("ÃƒÂ±", "ñ")
-    s = s.replace("Ã±", "ñ")
-    s = s.replace("ñ", "n")
+    s = s.replace("ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â±", "ÃƒÂ±")
+    s = s.replace("ÃƒÆ’Ã‚Â±", "ÃƒÂ±")
+    s = s.replace("ÃƒÂ±", "n")
     return s
 
 
@@ -1541,49 +1782,7 @@ def append_attempt_log(
         fh.write(row)
 
 
-def build_contrast_diagnostic_view(frame_bgr, clahe) -> any:
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    clahe_gray = clahe.apply(gray)
-    edges = cv2.Canny(clahe_gray, 80, 160)
-
-    h, w = gray.shape[:2]
-    tile_w = max(320, w // 2)
-    tile_h = max(180, h // 2)
-
-    def to_bgr(img_gray):
-        return cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
-
-    t1 = cv2.resize(frame_bgr, (tile_w, tile_h), interpolation=cv2.INTER_LINEAR)
-    t2 = cv2.resize(to_bgr(gray), (tile_w, tile_h), interpolation=cv2.INTER_LINEAR)
-    t3 = cv2.resize(to_bgr(clahe_gray), (tile_w, tile_h), interpolation=cv2.INTER_LINEAR)
-    t4 = cv2.resize(to_bgr(edges), (tile_w, tile_h), interpolation=cv2.INTER_LINEAR)
-
-    cv2.putText(t1, "Original", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(t2, "Gray", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(t3, "CLAHE", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(t4, "Edges", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-
-    row1 = cv2.hconcat([t1, t2])
-    row2 = cv2.hconcat([t3, t4])
-    diag = cv2.vconcat([row1, row2])
-
-    mean_gray, std_gray = cv2.meanStdDev(gray)
-    mean_clahe, std_clahe = cv2.meanStdDev(clahe_gray)
-    edge_ratio = 100.0 * float(cv2.countNonZero(edges)) / float(edges.size)
-
-    overlay = diag.copy()
-    cv2.rectangle(overlay, (0, 0), (diag.shape[1], 48), (0, 0, 0), -1)
-    cv2.addWeighted(overlay, 0.45, diag, 0.55, 0, diag)
-    metrics = (
-        f"Gray mean={float(mean_gray[0][0]):.1f} std={float(std_gray[0][0]):.1f}   "
-        f"CLAHE mean={float(mean_clahe[0][0]):.1f} std={float(std_clahe[0][0]):.1f}   "
-        f"Edge%={edge_ratio:.2f}"
-    )
-    cv2.putText(diag, metrics, (12, 31), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
-    return diag
-
-
-def draw_panel(img, zoom, u_bias, u_send, robot_status, x_mm=None, y_mm=None, z_mm=None, u_deg=None):
+def draw_panel(img, zoom, u_send, robot_status, x_mm=None, y_mm=None, z_mm=None, u_deg=None):
     BLUE = (200, 90, 20)
     BLUE_DARK = (150, 55, 10)
     WHITE = (255, 255, 255)
@@ -1686,7 +1885,7 @@ def draw_panel(img, zoom, u_bias, u_send, robot_status, x_mm=None, y_mm=None, z_
     cv2.line(panel, (x + 14, sep2), (x + w - 14, sep2), SOFT, 1, cv2.LINE_AA)
 
     cv2.putText(
-        panel, "R/F: U +/-   C: reset U   W/S: zoom",
+        panel, "W/S: zoom",
         (content_x, sep2 + 24),
         cv2.FONT_HERSHEY_SIMPLEX, 0.42, TEXT, 1, cv2.LINE_AA
     )
@@ -1708,23 +1907,7 @@ def draw_panel(img, zoom, u_bias, u_send, robot_status, x_mm=None, y_mm=None, z_
 
 
 def main() -> int:
-    # --- Calibracion manual ---
-    manual_calib_mode = False
-    manual_points_px = []       # [(x, y)]
-    manual_points_robot = []    # [(x_mm, y_mm)]
-    manual_homography = None
-    manual_homography_error = None
-    manual_homography_path = Path(__file__).resolve().parent / "homography_table1.json"
-    manual_last_click = None
-    manual_robot_idx = 0
-
-    def mouse_callback(event, x, y, flags, param):
-        nonlocal manual_last_click
-        if manual_calib_mode and event == cv2.EVENT_LBUTTONDOWN:
-            manual_last_click = (x, y)
-
     cv2.namedWindow("XYZU LIVE (click aqui para teclado)")
-    cv2.setMouseCallback("XYZU LIVE (click aqui para teclado)", mouse_callback)
 
     args = parse_args()
 
@@ -1778,6 +1961,17 @@ def main() -> int:
             robot_status = f"ROBOT: no conecta -> {exc}"
             robot = None
 
+    set_hmi_register(REG_SPEED, DEFAULT_SPEED)
+    if robot is not None:
+        try:
+            robot.write_register_int(REG_SPEED, DEFAULT_SPEED, signed=False)
+            print(f"[ROBOT SPEED] Velocidad inicial enviada al robot: {DEFAULT_SPEED}")
+        except Exception as exc:
+            print(f"[ROBOT SPEED ERROR] No se pudo inicializar velocidad: {exc}")
+
+    start_hmi_modbus_server(host="0.0.0.0", port=HMI_SERVER_PORT)
+    print("Servidor HMI listo. Configurar HMI hacia 192.168.250.2:1502")
+
     zoom = max(1.0, min(float(args.zoom), float(args.max_zoom)))
     zoom_step = max(0.05, float(args.zoom_step))
     max_zoom = max(1.0, float(args.max_zoom))
@@ -1830,7 +2024,6 @@ def main() -> int:
     blocked_target_center: Optional[Tuple[float, float]] = None
     blocked_target_until = 0.0
 
-    u_deg_bias = 0.0
     u_deg_send = 0.0
     u_word_live = None
 
@@ -1839,8 +2032,6 @@ def main() -> int:
 
     no_battery_since = None
     stop_sent = False
-    show_diagnostics = False
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     undistort_maps: Optional[Tuple[np.ndarray, np.ndarray]] = None
     undistort_map_size: Optional[Tuple[int, int]] = None
 
@@ -1863,10 +2054,6 @@ def main() -> int:
                     undistort_map_size = frame_size
                 map1, map2 = undistort_maps
                 frame = cv2.remap(frame, map1, map2, interpolation=cv2.INTER_LINEAR)
-
-            if show_diagnostics:
-                diag_view = build_contrast_diagnostic_view(frame, clahe)
-                cv2.imshow("DIAGNOSTICO CONTRASTE (D: on/off)", diag_view)
 
             results = model.predict(frame, conf=args.conf, iou=args.iou, imgsz=args.imgsz, verbose=False)
             result = results[0]
@@ -1980,7 +2167,7 @@ def main() -> int:
             battery_detected = target_obj is not None and tab_obj is not None
             hold_detection = False
 
-            if (now - last_pair_debug_ts) >= PAIR_DEBUG_PERIOD_S:
+            if PAIR_DEBUG_ENABLED and (now - last_pair_debug_ts) >= PAIR_DEBUG_PERIOD_S:
                 num_bat = sum(1 for obj in instances_info if _normalize_class_name(obj.get("class", "")) in BATTERY_CLASS_NAMES)
                 num_tab = sum(1 for obj in instances_info if _normalize_class_name(obj.get("class", "")) in TAB_CLASS_NAMES)
                 sel_bat_center = target_obj.get("center", None) if target_obj is not None else None
@@ -2090,7 +2277,7 @@ def main() -> int:
 
                         if tab_center is not None:
                             c_tab = (int(tab_center[0]), int(tab_center[1]))
-                            u_diag_send = normalize_deg_360(stable_u + u_deg_bias) if stable_u is not None else None
+                            u_diag_send = normalize_deg_360(stable_u) if stable_u is not None else None
                             axis_vec, axis_center = _battery_axis_vector_toward_tab(result, obj0, tab_center)
                             c_axis = (int(axis_center[0]), int(axis_center[1]))
                             axis_len = 70
@@ -2181,7 +2368,7 @@ def main() -> int:
                                 y_mm_live = y_mm
                                 robot_status = "ROBOT: bateria detectada, sin pestana"
                             else:
-                                u_deg_send = normalize_deg_360(stable_u + u_deg_bias)
+                                u_deg_send = normalize_deg_360(stable_u)
                                 u_word_live = angle_deg_to_word(u_deg_send)
                                 xyzu = (x_mm, y_mm, Z_MM_CONST, u_deg_send)
 
@@ -2203,7 +2390,7 @@ def main() -> int:
                                     if should_send_xyzu:
                                         try:
                                             robot.write_pose_robot_mm_deg(*xyzu)
-                                            # Enviar también a la HMI
+                                            # Enviar tambiÃƒÂ©n a la HMI
                                             send_coords_to_hmi(xyzu[0], xyzu[1], xyzu[2], xyzu[3])
                                             last_sent_xyzu = xyzu
                                             last_sent_ts = now
@@ -2247,7 +2434,6 @@ def main() -> int:
             annotated = draw_panel(
                 annotated,
                 zoom,
-                u_deg_bias,
                 u_deg_send,
                 robot_status,
                 x_mm_live,
@@ -2280,18 +2466,38 @@ def main() -> int:
                 cv2.LINE_AA,
             )
 
-            # Dibuja puntos de calibracion manual
-            if manual_calib_mode:
-                for idx, (px, py) in enumerate(manual_points_px):
-                    if idx < len(MANUAL_ROBOT_POINTS):
-                        rx, ry = MANUAL_ROBOT_POINTS[idx]
-                        cv2.circle(annotated, (int(px), int(py)), 6, (0, 255, 255), 2)
-                        cv2.putText(annotated, f"({rx:.1f},{ry:.1f})", (int(px) + 8, int(py) - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-                cv2.putText(annotated, f"CALIBRACION MANUAL: {len(manual_points_px)} puntos", (14, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-                if manual_homography is not None:
-                    cv2.putText(annotated, f"Homografia OK | Error: {manual_homography_error:.2f} mm", (14, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-                else:
-                    cv2.putText(annotated, "Agrega al menos 4 puntos", (14, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 2)
+            if pop_hmi_command(HMI_START):
+                print("[HMI CMD] Ejecutando START hacia robot")
+                robot_status = send_robot_action(robot, "START", START, args.pulse)
+                print(robot_status)
+
+            if pop_hmi_command(HMI_STOP):
+                print("[HMI CMD] Ejecutando STOP hacia robot")
+                robot_status = send_robot_action(robot, "STOP", STOP, args.pulse)
+                print(robot_status)
+
+            if pop_hmi_command(HMI_PAUSE):
+                print("[HMI CMD] Ejecutando PAUSE hacia robot")
+                robot_status = send_robot_action(robot, "PAUSE", PAUSE, args.pulse)
+                print(robot_status)
+
+            if pop_hmi_command(HMI_CONTINUE):
+                print("[HMI CMD] Ejecutando CONTINUE hacia robot")
+                robot_status = send_robot_action(robot, "CONTINUE", CONTINUE, args.pulse)
+                print(robot_status)
+
+            if pop_hmi_command(HMI_RESET):
+                print("[HMI CMD] Ejecutando RESET hacia robot")
+                robot_status = send_robot_action(robot, "RESET", RESET, args.pulse)
+                print(robot_status)
+
+            speed_value = pop_hmi_speed()
+            if speed_value is not None and robot is not None:
+                try:
+                    robot.write_register_int(REG_SPEED, speed_value, signed=False)
+                    print(f"[ROBOT SPEED] Velocidad enviada al robot word 97: {speed_value}")
+                except Exception as exc:
+                    print(f"[ROBOT SPEED ERROR] No se pudo escribir velocidad {speed_value} en word 97: {exc}")
 
             cv2.imshow("XYZU LIVE (click aqui para teclado)", annotated)
             key = cv2.waitKey(1) & 0xFF
@@ -2299,149 +2505,63 @@ def main() -> int:
             if key in (ord("q"), ord("Q")):
                 break
 
-            # --- Modo calibracion manual ---
-            if key == ord("m"):
-                manual_calib_mode = not manual_calib_mode
-                manual_points_px.clear()
-                manual_homography = None
-                manual_homography_error = None
-                manual_last_click = None
-                manual_robot_idx = 0
-                print(f"[MANUAL CALIB] Modo {'ACTIVADO' if manual_calib_mode else 'DESACTIVADO'}.")
-                if manual_calib_mode:
-                    print("[MANUAL CALIB] Haz click en la imagen y presiona 'p' para agregar punto.")
-
-            if manual_calib_mode:
-                if key == ord("p") and manual_last_click is not None and len(manual_points_px) < len(MANUAL_ROBOT_POINTS):
-                    px, py = manual_last_click
-                    manual_points_px.append((px, py))
-                    print(f"[MANUAL CALIB] Punto agregado: pixel=({px},{py}) robot={MANUAL_ROBOT_POINTS[len(manual_points_px)-1]}")
-                    manual_last_click = None
-
-                # Calcular homografia si hay al menos 4 puntos
-                if len(manual_points_px) >= 4:
-                    src = np.array(manual_points_px, dtype=np.float32)
-                    dst = np.array(MANUAL_ROBOT_POINTS[:len(manual_points_px)], dtype=np.float32)
-                    H, mask = cv2.findHomography(src, dst, method=0)
-                    if H is not None:
-                        manual_homography = H
-                        reproj = cv2.perspectiveTransform(src.reshape(-1, 1, 2), H).reshape(-1, 2)
-                        error = np.linalg.norm(reproj - dst, axis=1)
-                        mean_error = np.mean(error)
-                        manual_homography_error = mean_error
-                        print("[MANUAL CALIB] Homografia calculada:")
-                        print(H)
-                        for i, (p, r, rep) in enumerate(zip(manual_points_px, MANUAL_ROBOT_POINTS, error)):
-                            print(f"  Punto {i+1}: pixel={p} robot={r} -> reproy={reproj[i]} | error={rep:.2f} mm")
-                        print(f"[MANUAL CALIB] Error medio de reproyeccion: {mean_error:.2f} mm")
+            if key in (ord("w"), ord("W")):
+                zoom = min(max_zoom, zoom + zoom_step)
+            elif key in (ord("s"), ord("S")):
+                zoom = max(1.0, zoom - zoom_step)
+            elif key == ord("0"):
+                zoom = 1.0
+            elif key in (ord("h"), ord("H")):
+                if mesa_idx is None:
+                    print("[WARN] No hay mesa detectada para capturar la homografia.")
+                else:
+                    homography, src_pts = compute_table_homography(result, mesa_idx)
+                    if homography is None or src_pts is None:
+                        print("[WARN] No se pudo calcular una homografia valida con la deteccion actual.")
                     else:
-                        manual_homography = None
-                        manual_homography_error = None
-
-                # Guardar homografia manual con 'h'
-                if key == ord("h") and manual_homography is not None:
-                    payload = {
-                        "homography": manual_homography.tolist(),
-                        "src_pts": np.array(manual_points_px, dtype=np.float32).tolist(),
-                        "dst_pts_robot": np.array(MANUAL_ROBOT_POINTS[:len(manual_points_px)], dtype=np.float32).tolist(),
-                        "table_width_mm": TABLE_WIDTH_MM,
-                        "table_height_mm": TABLE_HEIGHT_MM,
-                        "zoom": zoom,
-                        "width": args.width,
-                        "height": args.height,
-                        "undistort": bool(args.undistort),
-                        "saved_at": datetime.now().isoformat(timespec="seconds"),
-                    }
-                    with open(manual_homography_path, "w", encoding="utf-8") as f:
-                        json.dump(payload, f, indent=2)
-                    print(f"[MANUAL CALIB] Homografia manual guardada en {manual_homography_path}")
-
-                # Borrar puntos/homografia manual con 'x'
-                if key == ord("x"):
-                    manual_points_px.clear()
-                    manual_homography = None
-                    manual_homography_error = None
-                    print("[MANUAL CALIB] Puntos y homografia manual borrados.")
-
-                # Usar homografia manual si existe
-                if manual_homography is not None:
-                    fixed_homography = manual_homography
-                    fixed_homography_src_pts = np.array(manual_points_px, dtype=np.float32)
-                    args.x_offset_mm = 0.0
-                    args.y_offset_mm = 0.0
-
-            else:
-                # --- Teclas fuera del modo calibracion manual ---
-                if key in (ord("w"), ord("W")):
-                    zoom = min(max_zoom, zoom + zoom_step)
-                elif key in (ord("s"), ord("S")):
-                    zoom = max(1.0, zoom - zoom_step)
-                elif key == ord("0"):
-                    zoom = 1.0
-                elif key in (ord("r"), ord("R")):
-                    u_deg_bias += U_STEP_DEG
-                elif key in (ord("f"), ord("F")):
-                    u_deg_bias -= U_STEP_DEG
-                elif key in (ord("c"), ord("C")):
-                    u_deg_bias = 0.0
-                elif key in (ord("d"), ord("D")):
-                    show_diagnostics = not show_diagnostics
-                    if not show_diagnostics:
                         try:
-                            cv2.destroyWindow("DIAGNOSTICO CONTRASTE (D: on/off)")
-                        except cv2.error:
-                            pass
-                elif key in (ord("h"), ord("H")):
-                    if mesa_idx is None:
-                        print("[WARN] No hay mesa detectada para capturar la homografia.")
-                    else:
-                        homography, src_pts = compute_table_homography(result, mesa_idx)
-                        if homography is None or src_pts is None:
-                            print("[WARN] No se pudo calcular una homografia valida con la deteccion actual.")
-                        else:
-                            try:
-                                save_fixed_homography_with_metadata(
-                                    fixed_homography_path,
-                                    homography,
-                                    src_pts,
-                                    current_homography_metadata,
-                                )
-                                fixed_homography = homography
-                                fixed_homography_src_pts = src_pts
-                                homography_status = HOMOGRAPHY_STATUS_ON
-                                homography_status_until = 0.0
-                                print(f"[INFO] Homografia fija activada: {fixed_homography_path.name}")
-                            except Exception as exc:
-                                print(f"[WARN] No se pudo guardar la homografia fija: {exc}")
-                elif key in (ord("x"), ord("X")):
-                    try:
-                        delete_fixed_homography(fixed_homography_path)
-                        fixed_homography = None
-                        fixed_homography_src_pts = None
-                        homography_status = HOMOGRAPHY_STATUS_DELETED
-                        homography_status_until = time.time() + 2.0
-                    except Exception as exc:
-                        print(f"[WARN] No se pudo borrar la homografia fija: {exc}")
-                elif key == ord("1"):
-                    if last_target_center is not None:
-                        blocked_target_center = last_target_center
-                        blocked_target_until = time.time() + PICKED_TARGET_BLOCK_S
-                    orientation_samples.clear()
-                    last_compass = None
-                    last_target_class = None
-                    last_target_center = None
-                    last_center_smoothed = None
-                    last_u_smoothed = None
-                    last_valid_xyzu = None
-                    robot_status = send_robot_action(robot, "START", START, args.pulse)
-                elif key == ord("2"):
-                    robot_status = send_robot_action(robot, "STOP", STOP, args.pulse)
-                elif key == ord("3"):
-                    robot_status = send_robot_action(robot, "PAUSE", PAUSE, args.pulse)
-                elif key == ord("4"):
-                    robot_status = send_robot_action(robot, "CONTINUE", CONTINUE, args.pulse)
-                elif key == ord("5"):
-                    robot_status = send_robot_action(robot, "RESET", RESET, args.pulse)
+                            save_fixed_homography_with_metadata(
+                                fixed_homography_path,
+                                homography,
+                                src_pts,
+                                current_homography_metadata,
+                            )
+                            fixed_homography = homography
+                            fixed_homography_src_pts = src_pts
+                            homography_status = HOMOGRAPHY_STATUS_ON
+                            homography_status_until = 0.0
+                            print(f"[INFO] Homografia fija activada: {fixed_homography_path.name}")
+                        except Exception as exc:
+                            print(f"[WARN] No se pudo guardar la homografia fija: {exc}")
+            elif key in (ord("x"), ord("X")):
+                try:
+                    delete_fixed_homography(fixed_homography_path)
+                    fixed_homography = None
+                    fixed_homography_src_pts = None
+                    homography_status = HOMOGRAPHY_STATUS_DELETED
+                    homography_status_until = time.time() + 2.0
+                except Exception as exc:
+                    print(f"[WARN] No se pudo borrar la homografia fija: {exc}")
+            elif key == ord("1"):
+                if last_target_center is not None:
+                    blocked_target_center = last_target_center
+                    blocked_target_until = time.time() + PICKED_TARGET_BLOCK_S
+                orientation_samples.clear()
+                last_compass = None
+                last_target_class = None
+                last_target_center = None
+                last_center_smoothed = None
+                last_u_smoothed = None
+                last_valid_xyzu = None
+                robot_status = send_robot_action(robot, "START", START, args.pulse)
+            elif key == ord("2"):
+                robot_status = send_robot_action(robot, "STOP", STOP, args.pulse)
+            elif key == ord("3"):
+                robot_status = send_robot_action(robot, "PAUSE", PAUSE, args.pulse)
+            elif key == ord("4"):
+                robot_status = send_robot_action(robot, "CONTINUE", CONTINUE, args.pulse)
+            elif key == ord("5"):
+                robot_status = send_robot_action(robot, "RESET", RESET, args.pulse)
 
     finally:
         if backend == "picamera2":
