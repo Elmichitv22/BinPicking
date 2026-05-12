@@ -92,14 +92,8 @@ HMI_STOP = 520
 HMI_PAUSE = 521
 HMI_CONTINUE = 522
 HMI_RESET = 523
-
-# Nuevos botones para control de motor
-HMI_MOTOR_ON = 533
-HMI_MOTOR_OFF = 534
-
-# Nuevos botones para control de motor
-HMI_MOTOR_ON = 533
-HMI_MOTOR_OFF = 534
+HMI_MOTOR_ON = 524
+HMI_MOTOR_OFF = 525
 
 hmi_coils = {}
 hmi_lock = threading.Lock()
